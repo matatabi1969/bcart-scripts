@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bカート 複数受注番号まとめて検索 v25（発送指示書デザイン統合）
 // @namespace    http://tampermonkey.net/
-// @version      25.15
+// @version      25.25
 // @description  複数受注番号の絞り込み・納品書印刷・ドラッグ移動・ポップアップ時自動非表示
 // @author       You
 // @match        https://*.bcart.jp/admin/order*
@@ -195,7 +195,7 @@
     } catch(e) {}
     header.addEventListener('mousedown', function(e) {
       if (e.target === minBtn) return;
-      e.preventDefault(); dragging = true;
+      dragging = true;
       const rect = panel.getBoundingClientRect();
       panel.style.right = 'auto'; panel.style.left = rect.left + 'px'; panel.style.top = rect.top + 'px';
       ox = e.clientX - rect.left; oy = e.clientY - rect.top;
@@ -214,8 +214,8 @@
 
   // 折りたたみ
   const minBtn = document.getElementById('bcart-min-btn');
-  document.getElementById('bcart-header').addEventListener('click', function(e) {
-    if (e.target !== minBtn) return;
+  minBtn.addEventListener('click', function(e) {
+    e.stopPropagation();
     panel.classList.toggle('minimized');
     minBtn.textContent = panel.classList.contains('minimized') ? '＋' : '－';
   });
@@ -445,7 +445,9 @@
   resetBtn.addEventListener('click', () => { clearState(); location.reload(); });
 
   // 冷蔵ヤマト着払い対象の商品ID（輸入代行費グループA）
-  const COLD_PRODUCT_IDS = new Set(['3','4','5','6','7','8','53','65','66','84','126','161','181','190','191']);
+  const COLD_PRODUCT_IDS = new Set(['3','4','5','6','7','8','53','65','66','84','181','190','191']);
+  // ヤマトクール元払い対象商品ID
+  const COOL_PREPAID_IDS = new Set(['27','55','58','170','185']);
   const productImageCache = {};
   async function fetchProductImage(productId) {
     if (!productId) return '';
@@ -489,28 +491,35 @@
     let deliveryGroup = '', companyName = '', orderCodeFromPage = '';
     let personName = '', tel = '', zip = '', address1 = '', address2 = '';
     const allTds = doc.querySelectorAll('td');
+
+    // tdインデックスで直接取得（ラベルなし構造）
+    // [7]=電話番号 [10]=配送グループ [14]=会社名 [15]=担当者 [16]=住所
+    if (allTds[7])  tel          = allTds[7].textContent.trim().replace(/\s+/g,'');
+    if (allTds[10]) deliveryGroup= allTds[10].textContent.trim();
+    if (allTds[14]) companyName  = allTds[14].textContent.trim();
+    if (allTds[15]) personName   = allTds[15].textContent.trim();
+    if (allTds[16]) {
+      const addrText = allTds[16].textContent.replace(/\s+/g,'').trim();
+      // 郵便番号抽出
+      const zipMatch = addrText.match(/〒?(\d{3})-?(\d{4})/);
+      if (zipMatch) zip = zipMatch[1] + zipMatch[2];
+      // 郵便番号を除いた住所本体
+      const addrBody = addrText.replace(/〒?\d{3}-?\d{4}/, '').trim();
+      // 番地で住所と建物名を分割
+      const streetMatch = addrBody.match(/^(.+?\d+[-－]\d+(?:[-－]\d+)?)(.*)$/);
+      if (streetMatch) {
+        address1 = streetMatch[1];
+        address2 = streetMatch[2];
+      } else {
+        address1 = addrBody;
+      }
+    }
+
+    // ラベルベースでも補完（念のため）
     allTds.forEach((td, i) => {
       const label = td.textContent.trim();
       const next = allTds[i+1];
-      if ((label === '配送先 会社名' || label === '配送先会社名' || label === '会社名') && !companyName) {
-        if (next) companyName = next.textContent.trim();
-      }
-      if (label === '配送グループ') { if (next) deliveryGroup = next.textContent.trim(); }
-      if ((label === '配送先 担当者' || label === '配送先担当者' || label === '担当者') && !personName) {
-        if (next) personName = next.textContent.trim();
-      }
-      if ((label === '配送先 電話番号' || label === '配送先電話番号') && !tel) {
-        if (next) tel = next.textContent.trim();
-      }
-      if ((label === '配送先住所' || label === '配送先 住所') && !address1) {
-        if (next) {
-          const addrText = next.textContent.replace(/\s+/g, '').trim();
-          const zipMatch = addrText.match(/〒?(\d{3}-?\d{4})/);
-          if (zipMatch) zip = zipMatch[1].replace(/-/g, '');
-          const addrMatch = addrText.replace(/〒?\d{3}-?\d{4}/, '').trim();
-          address1 = addrMatch;
-        }
-      }
+      if (label === '配送グループ' && next) deliveryGroup = deliveryGroup || next.textContent.trim();
     });
     const orderLinks = doc.querySelectorAll('a[href*="/admin/order/"]');
     orderLinks.forEach(link => { const txt = link.textContent.trim(); if (/^\d{11,}$/.test(txt) && !orderCodeFromPage) orderCodeFromPage = txt; });
@@ -560,32 +569,51 @@
     const productsWithImages = await Promise.all(
       productPromises.map(async p => {
         const imgSrc = p.productId ? await fetchProductImage(p.productId) : '';
-        if (p.productId && COLD_PRODUCT_IDS.has(p.productId)) {
-          deliveryGroup = '輸入代行費グループA';
-        }
-        return { name: p.productName, setName: p.setName || '', quantity: p.quantity, imgSrc };
+        return { name: p.productName, setName: p.setName || '', quantity: p.quantity, imgSrc, productId: p.productId };
       })
     );
     products.push(...productsWithImages.filter(p => p.name && p.name.length > 0));
-    return { logisticsId, orderCode: orderCodeFromPage, companyName: companyName || '（会社名取得中）', deliveryGroup, personName, tel, zip, address1, address2, products };
+
+    // 冷蔵判定: 商品IDリストにある商品が含まれる場合のみ冷蔵（配送グループは無視）
+    const hasColdProduct = products.some(p => p.productId && COLD_PRODUCT_IDS.has(p.productId));
+    const hasCoolPrepaid = products.some(p => p.productId && COOL_PREPAID_IDS.has(p.productId));
+    const finalDeliveryGroup = hasColdProduct ? '輸入代行費グループA' : hasCoolPrepaid ? 'ヤマトクール元払い' : '';
+    return { logisticsId, orderCode: orderCodeFromPage, companyName: companyName || '（会社名取得中）', deliveryGroup: finalDeliveryGroup, personName, tel, zip, address1, address2, products };
   }
 
   // 発送指示書HTML生成
   function generateShippingInstructionHTML(orders) {
     const MAX_PROD_PER_PAGE = 7;
     const flatOrders = [];
+
     orders.forEach(order => {
       const prods = order.products || [];
-      if (prods.length > MAX_PROD_PER_PAGE) {
-        const chunks = [];
-        for (let i = 0; i < prods.length; i += MAX_PROD_PER_PAGE) chunks.push(prods.slice(i, i + MAX_PROD_PER_PAGE));
-        chunks.forEach((chunk, ci) => flatOrders.push({ ...order, products: chunk, isContinued: ci > 0, chunkIndex: ci, totalChunks: chunks.length }));
-      } else {
-        flatOrders.push(order);
-      }
+
+      // 商品を3グループに分割（productIdを文字列化して比較）
+      const normalProds = prods.filter(p => !COLD_PRODUCT_IDS.has(String(p.productId)) && !COOL_PREPAID_IDS.has(String(p.productId)));
+      const coolProds   = prods.filter(p => COOL_PREPAID_IDS.has(String(p.productId)));
+      const coldProds   = prods.filter(p => COLD_PRODUCT_IDS.has(String(p.productId)));
+
+      const pushGroup = (groupProds, deliveryGroup) => {
+        if (!groupProds.length) return;
+        const groupOrder = { ...order, products: groupProds, deliveryGroup };
+        if (groupProds.length > MAX_PROD_PER_PAGE) {
+          const chunks = [];
+          for (let i = 0; i < groupProds.length; i += MAX_PROD_PER_PAGE) chunks.push(groupProds.slice(i, i + MAX_PROD_PER_PAGE));
+          chunks.forEach((chunk, ci) => flatOrders.push({ ...groupOrder, products: chunk, isContinued: ci > 0, chunkIndex: ci, totalChunks: chunks.length }));
+        } else {
+          flatOrders.push(groupOrder);
+        }
+      };
+
+      pushGroup(normalProds, '');
+      pushGroup(coolProds, 'ヤマトクール元払い');
+      pushGroup(coldProds, '輸入代行費グループA');
     });
+
     const coldOrders   = flatOrders.filter(o => (o.deliveryGroup||'').includes('輸入代行費グループA'));
-    const normalOrders = flatOrders.filter(o => !(o.deliveryGroup||'').includes('輸入代行費グループA'));
+    const coolOrders   = flatOrders.filter(o => (o.deliveryGroup||'').includes('ヤマトクール元払い'));
+    const normalOrders = flatOrders.filter(o => !(o.deliveryGroup||'').includes('輸入代行費グループA') && !(o.deliveryGroup||'').includes('ヤマトクール元払い'));
     function layoutOrders(orderList) {
       // 合計商品数が3以内なら同居、3商品以上の受注は単独ページ
       const MAX_PRODUCTS = 3;
@@ -607,7 +635,7 @@
       flush();
       return result;
     }
-    const pages = [...layoutOrders(normalOrders), ...layoutOrders(coldOrders)];
+    const pages = [...layoutOrders(normalOrders), ...layoutOrders(coolOrders), ...layoutOrders(coldOrders)];
     const totalPages = pages.length;
     const today = new Date();
     const dateStr = today.getFullYear()+'/'+String(today.getMonth()+1).padStart(2,'0')+'/'+String(today.getDate()).padStart(2,'0');
@@ -616,7 +644,11 @@
       const isLarge = (order.totalChunks||1) > 1;
       const isContinued = order.isContinued||false;
       const chunkLabel = isLarge ? ` <span class="large-badge">⚡ 大量注文 ${(order.chunkIndex||0)+1}/${order.totalChunks}</span>` : '';
-      const coldLabel = (order.deliveryGroup||'').includes('輸入代行費グループA') ? '<div class="cold-badge">🧊 冷蔵ヤマト着払いで配送</div>' : '';
+      const coldLabel = (order.deliveryGroup||'').includes('輸入代行費グループA')
+        ? '<div class="cold-badge">🧊 冷蔵ヤマト着払いで配送</div>'
+        : (order.deliveryGroup||'').includes('ヤマトクール元払い')
+        ? '<div class="cool-badge">🚚 ヤマトクール元払いで配送</div>'
+        : '';
       const rows = (order.products||[]).map(p => `
         <tr>
           <td class="col-ck">
@@ -731,6 +763,7 @@
   .set-name{font-size:10px;color:var(--text-muted);margin-top:2px;}
   .large-badge{display:inline-block;background:#fef3c7;color:#92400e;border:1px solid #fcd34d;border-radius:4px;font-size:10px;font-weight:700;padding:1px 5px;margin-left:4px;vertical-align:middle;}
   .cold-badge{display:block;background:#fff1f2;color:#dc2626;border:1.5px solid #fca5a5;border-radius:5px;padding:4px 8px;font-size:11px;font-weight:700;text-align:center;}
+  .cool-badge{display:block;background:#f0fdf4;color:#16a34a;border:1.5px solid #86efac;border-radius:5px;padding:4px 8px;font-size:11px;font-weight:700;text-align:center;}
   .check-block{background:#f8fafc;border:1.5px solid var(--border);border-radius:6px;padding:5px 8px;}
   .check-block-second{background:#fff7ed;border-color:#fed7aa;}
   .check-title{font-size:10px;font-weight:700;color:var(--text-muted);margin-bottom:3px;}
