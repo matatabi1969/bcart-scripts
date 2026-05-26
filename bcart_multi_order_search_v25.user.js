@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bカート 複数受注番号まとめて検索 v25（発送指示書デザイン統合）
 // @namespace    http://tampermonkey.net/
-// @version      25.13
+// @version      25.15
 // @description  複数受注番号の絞り込み・納品書印刷・ドラッグ移動・ポップアップ時自動非表示
 // @author       You
 // @match        https://*.bcart.jp/admin/order*
@@ -30,6 +30,11 @@
           logisticsId: o.logisticsId || '',
           orderCode:   o.orderCode   || '',
           companyName: o.companyName || '',
+          personName:  o.personName  || '',
+          tel:         o.tel         || '',
+          zip:         o.zip         || '',
+          address1:    o.address1    || '',
+          address2:    o.address2    || '',
         }))
       }));
       // GETパラメータでGASに送信（iframeで開く）
@@ -143,8 +148,8 @@
         <div class="bcart-tab" data-tab="csv">CSVアップロード</div>
       </div>
       <div class="bcart-tab-content active" id="tab-text">
-        <textarea id="bcart-text-input" placeholder="例：&#10;17790995019&#10;17790906563"></textarea>
-        <div class="bcart-hint">※ 1行に1つの受注番号を入力</div>
+        <textarea id="bcart-text-input" placeholder="例：&#10;17790995019&#10;20003182&#10;（受注番号・発送ID両対応）"></textarea>
+        <div class="bcart-hint">※ 1行に1つ入力（受注番号・発送ID混在OK）</div>
       </div>
       <div class="bcart-tab-content" id="tab-csv">
         <div id="bcart-drop-area">
@@ -400,10 +405,13 @@
       if (!isRestore) statusDiv.textContent = `🔄 検索中… (${i + 1}/${orderNumbers.length})`;
       progressBar.style.width = `${Math.round((i + 1) / orderNumbers.length * 100)}%`;
       try {
+        const num = orderNumbers[i];
+        const isLogisticsId = /^\d{8}$/.test(num); // 8桁 → 発送ID
         const base = location.pathname.includes('logistics') ? '/admin/logistics/list' : '/admin/order/list';
-        const res = await fetch(`${base}?order_code=${encodeURIComponent(orderNumbers[i])}`, { credentials: 'same-origin' });
+        const param = isLogisticsId ? `logistics_id=${encodeURIComponent(num)}` : `order_code=${encodeURIComponent(num)}`;
+        const res = await fetch(`${base}?${param}`, { credentials: 'same-origin' });
         const doc = new DOMParser().parseFromString(await res.text(), 'text/html');
-        doc.querySelectorAll('table tbody tr').forEach(r => { if (r.textContent.includes(orderNumbers[i])) allRows.push(r.outerHTML); });
+        doc.querySelectorAll('table tbody tr').forEach(r => { if (r.textContent.includes(num)) allRows.push(r.outerHTML); });
       } catch(e) {}
       await new Promise(r => setTimeout(r, 300));
     }
@@ -479,13 +487,30 @@
     const text = await res.text();
     const doc = new DOMParser().parseFromString(text, 'text/html');
     let deliveryGroup = '', companyName = '', orderCodeFromPage = '';
+    let personName = '', tel = '', zip = '', address1 = '', address2 = '';
     const allTds = doc.querySelectorAll('td');
     allTds.forEach((td, i) => {
       const label = td.textContent.trim();
+      const next = allTds[i+1];
       if ((label === '配送先 会社名' || label === '配送先会社名' || label === '会社名') && !companyName) {
-        const next = allTds[i+1]; if (next) companyName = next.textContent.trim();
+        if (next) companyName = next.textContent.trim();
       }
-      if (label === '配送グループ') { const next = allTds[i+1]; if (next) deliveryGroup = next.textContent.trim(); }
+      if (label === '配送グループ') { if (next) deliveryGroup = next.textContent.trim(); }
+      if ((label === '配送先 担当者' || label === '配送先担当者' || label === '担当者') && !personName) {
+        if (next) personName = next.textContent.trim();
+      }
+      if ((label === '配送先 電話番号' || label === '配送先電話番号') && !tel) {
+        if (next) tel = next.textContent.trim();
+      }
+      if ((label === '配送先住所' || label === '配送先 住所') && !address1) {
+        if (next) {
+          const addrText = next.textContent.replace(/\s+/g, '').trim();
+          const zipMatch = addrText.match(/〒?(\d{3}-?\d{4})/);
+          if (zipMatch) zip = zipMatch[1].replace(/-/g, '');
+          const addrMatch = addrText.replace(/〒?\d{3}-?\d{4}/, '').trim();
+          address1 = addrMatch;
+        }
+      }
     });
     const orderLinks = doc.querySelectorAll('a[href*="/admin/order/"]');
     orderLinks.forEach(link => { const txt = link.textContent.trim(); if (/^\d{11,}$/.test(txt) && !orderCodeFromPage) orderCodeFromPage = txt; });
@@ -516,12 +541,21 @@
       const productId = match ? match[1] : '';
       const productName = productLink.textContent.trim().replace(/\s+/g, ' ');
       if (!productName) return;
+
+      // セット名はセル[1]のテキスト
+      let setName = '';
+      if (cells[1]) {
+        const setTxt = cells[1].textContent.trim().replace(/\s+/g, ' ');
+        // 商品名と異なる場合のみセット名として使用
+        if (setTxt && setTxt !== productName) setName = setTxt;
+      }
+
       let quantity = '1';
       cells.forEach(cell => {
         const txt = cell.textContent.trim();
         if (txt.match(/^\d+$/) && parseInt(txt) > 0 && parseInt(txt) < 10000) quantity = txt;
       });
-      productPromises.push({ productId, productName, quantity });
+      productPromises.push({ productId, productName, setName, quantity });
     });
     const productsWithImages = await Promise.all(
       productPromises.map(async p => {
@@ -529,11 +563,11 @@
         if (p.productId && COLD_PRODUCT_IDS.has(p.productId)) {
           deliveryGroup = '輸入代行費グループA';
         }
-        return { name: p.productName, quantity: p.quantity, imgSrc };
+        return { name: p.productName, setName: p.setName || '', quantity: p.quantity, imgSrc };
       })
     );
     products.push(...productsWithImages.filter(p => p.name && p.name.length > 0));
-    return { logisticsId, orderCode: orderCodeFromPage, companyName: companyName || '（会社名取得中）', deliveryGroup, address: '', personName: '', products };
+    return { logisticsId, orderCode: orderCodeFromPage, companyName: companyName || '（会社名取得中）', deliveryGroup, personName, tel, zip, address1, address2, products };
   }
 
   // 発送指示書HTML生成
@@ -553,27 +587,24 @@
     const coldOrders   = flatOrders.filter(o => (o.deliveryGroup||'').includes('輸入代行費グループA'));
     const normalOrders = flatOrders.filter(o => !(o.deliveryGroup||'').includes('輸入代行費グループA'));
     function layoutOrders(orderList) {
+      // 合計商品数が3以内なら同居、3商品以上の受注は単独ページ
+      const MAX_PRODUCTS = 3;
       const result = [];
-      let buf1 = [], buf2 = [];
-      const flushBuf1 = () => { if (buf1.length > 0) { result.push({ orders: buf1 }); buf1 = []; } };
-      const flushBuf2 = () => { if (buf2.length > 0) { result.push({ orders: buf2 }); buf2 = []; } };
+      let buf = [], bufTotal = 0;
+      const flush = () => { if (buf.length > 0) { result.push({ orders: buf }); buf = []; bufTotal = 0; } };
       orderList.forEach(order => {
         const n = (order.products || []).length;
         const isSplit = (order.totalChunks || 1) > 1;
         if (n >= 3 || isSplit) {
-          flushBuf1(); flushBuf2();
+          flush();
           result.push({ orders: [order] });
-        } else if (n === 2) {
-          flushBuf1();
-          buf2.push(order);
-          if (buf2.length >= 2) { result.push({ orders: buf2 }); buf2 = []; }
         } else {
-          flushBuf2();
-          buf1.push(order);
-          if (buf1.length >= 3) { result.push({ orders: buf1 }); buf1 = []; }
+          if (bufTotal + n > MAX_PRODUCTS) flush();
+          buf.push(order);
+          bufTotal += n;
         }
       });
-      flushBuf1(); flushBuf2();
+      flush();
       return result;
     }
     const pages = [...layoutOrders(normalOrders), ...layoutOrders(coldOrders)];
@@ -593,7 +624,7 @@
             <div class="ck-row"><div class="ck-label">ダブル</div><div class="ck-box"></div></div>
           </td>
           <td class="col-img">${p.imgSrc ? `<img src="${p.imgSrc}" class="product-img" onerror="this.style.display='none'">` : ''}</td>
-          <td>${p.name||''}</td>
+          <td>${p.name||''}${p.setName ? `<div class="set-name">${p.setName}</div>` : ''}</td>
           <td class="col-qty"><span class="qty-badge">×<span class="qty-num">${p.quantity||p.qty||1}</span></span></td>
         </tr>`).join('');
       const staffCheck = isContinued
@@ -697,6 +728,7 @@
   .product-img{width:116px;height:116px;object-fit:contain;border:1px solid var(--border);border-radius:4px;background:white;padding:2px;display:block;margin:0 auto;}
   .qty-badge{background:#fef3c7;color:#1e3a8a;border-radius:5px;padding:2px 6px;font-weight:900;font-size:14px;display:inline-block;}
   .qty-num{font-size:20px;}
+  .set-name{font-size:10px;color:var(--text-muted);margin-top:2px;}
   .large-badge{display:inline-block;background:#fef3c7;color:#92400e;border:1px solid #fcd34d;border-radius:4px;font-size:10px;font-weight:700;padding:1px 5px;margin-left:4px;vertical-align:middle;}
   .cold-badge{display:block;background:#fff1f2;color:#dc2626;border:1.5px solid #fca5a5;border-radius:5px;padding:4px 8px;font-size:11px;font-weight:700;text-align:center;}
   .check-block{background:#f8fafc;border:1.5px solid var(--border);border-radius:6px;padding:5px 8px;}
