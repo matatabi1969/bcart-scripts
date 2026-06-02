@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bカート 複数受注番号まとめて検索 v25（発送指示書デザイン統合）
 // @namespace    http://tampermonkey.net/
-// @version      25.25
+// @version      25.35
 // @description  複数受注番号の絞り込み・納品書印刷・ドラッグ移動・ポップアップ時自動非表示
 // @author       You
 // @match        https://*.bcart.jp/admin/order*
@@ -22,10 +22,10 @@
   // =============================================
   const GAS_URL = 'https://script.google.com/macros/s/AKfycbwZkAZDpo7kGQDnVoyg7YxFbzsFhatASvQTc-zVbrTne53o9RjG4fPRpjT328NXrre4/exec';
 
-  function notifyGAS(orders) {
+  function notifyGAS(orders, shippingHtml) {
     if (!GAS_URL) return;
     try {
-      const payload = encodeURIComponent(JSON.stringify({
+      const payload = JSON.stringify({
         orders: orders.map(o => ({
           logisticsId: o.logisticsId || '',
           orderCode:   o.orderCode   || '',
@@ -35,16 +35,30 @@
           zip:         o.zip         || '',
           address1:    o.address1    || '',
           address2:    o.address2    || '',
-        }))
-      }));
-      // GETパラメータでGASに送信（iframeで開く）
-      const url = GAS_URL + '?payload=' + payload;
+          address3:    o.address3    || '',
+        })),
+        shippingHtml: shippingHtml || '',
+      });
+      const form = document.createElement('form');
+      form.method = 'POST';
+      form.action = GAS_URL;
+      form.target = 'gas_iframe_' + Date.now();
+      form.style.display = 'none';
+      const input = document.createElement('input');
+      input.type = 'hidden';
+      input.name = 'payload';
+      input.value = payload;
+      form.appendChild(input);
       const iframe = document.createElement('iframe');
-      iframe.src = url;
+      iframe.name = form.target;
       iframe.style.display = 'none';
       document.body.appendChild(iframe);
-      setTimeout(() => { try { document.body.removeChild(iframe); } catch(e) {} }, 5000);
-      console.log('[GAS通知] GET送信:', orders.length, '件');
+      document.body.appendChild(form);
+      form.submit();
+      setTimeout(() => {
+        try { document.body.removeChild(form); document.body.removeChild(iframe); } catch(e) {}
+      }, 5000);
+      console.log('[GAS通知] POST送信:', orders.length, '件');
     } catch(e) {
       console.error('[GAS通知] エラー:', e);
     }
@@ -449,6 +463,27 @@
   // ヤマトクール元払い対象商品ID
   const COOL_PREPAID_IDS = new Set(['27','55','58','170','185']);
   const productImageCache = {};
+  const productBase64Cache = {};
+
+  async function fetchImageAsBase64(imgUrl) {
+    if (!imgUrl) return '';
+    if (productBase64Cache[imgUrl] !== undefined) return productBase64Cache[imgUrl];
+    try {
+      const res = await fetch(imgUrl, { credentials: 'same-origin' });
+      const blob = await res.blob();
+      const base64 = await new Promise(resolve => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(reader.result);
+        reader.readAsDataURL(blob);
+      });
+      productBase64Cache[imgUrl] = base64;
+      return base64;
+    } catch(e) {
+      productBase64Cache[imgUrl] = '';
+      return '';
+    }
+  }
+
   async function fetchProductImage(productId) {
     if (!productId) return '';
     if (productImageCache[productId] !== undefined) return productImageCache[productId];
@@ -489,7 +524,7 @@
     const text = await res.text();
     const doc = new DOMParser().parseFromString(text, 'text/html');
     let deliveryGroup = '', companyName = '', orderCodeFromPage = '';
-    let personName = '', tel = '', zip = '', address1 = '', address2 = '';
+    let personName = '', tel = '', zip = '', address1 = '', address2 = '', address3 = '';
     const allTds = doc.querySelectorAll('td');
 
     // tdインデックスで直接取得（ラベルなし構造）
@@ -500,18 +535,44 @@
     if (allTds[15]) personName   = allTds[15].textContent.trim();
     if (allTds[16]) {
       const addrText = allTds[16].textContent.replace(/\s+/g,'').trim();
-      // 郵便番号抽出
+      // 郵便番号抽出（ハイフンあり形式で保持）
       const zipMatch = addrText.match(/〒?(\d{3})-?(\d{4})/);
-      if (zipMatch) zip = zipMatch[1] + zipMatch[2];
+      if (zipMatch) zip = zipMatch[1] + '-' + zipMatch[2];
       // 郵便番号を除いた住所本体
       const addrBody = addrText.replace(/〒?\d{3}-?\d{4}/, '').trim();
-      // 番地で住所と建物名を分割
-      const streetMatch = addrBody.match(/^(.+?\d+[-－]\d+(?:[-－]\d+)?)(.*)$/);
-      if (streetMatch) {
-        address1 = streetMatch[1];
-        address2 = streetMatch[2];
+      // 都道府県+市区町村 / 番地 / 建物名に3分割
+      const prefMatch = addrBody.match(/^(北海道|東京都|京都府|大阪府|.{2,3}県)(.+)/);
+      if (prefMatch) {
+        const pref = prefMatch[1];
+        const rest = prefMatch[2];
+        // 番地パターン（数字-数字）で分割
+        const streetMatch = rest.match(/^(.+?)((?:\d+[-－]\d+(?:[-－]\d+)?).*)$/);
+        if (streetMatch) {
+          const cityPart = streetMatch[1]; // 市区町村
+          const streetAndBuilding = streetMatch[2];
+          // 番地と建物名を分割
+          const buildingMatch = streetAndBuilding.match(/^(\d+[-－]\d+(?:[-－]\d+)?)(.*)$/);
+          if (buildingMatch) {
+            address1 = pref + cityPart;      // 都道府県+市区町村
+            address2 = buildingMatch[1];      // 番地
+            address2 = pref + cityPart + buildingMatch[1]; // ゆうプリR[15]用: 都道府県〜番地
+            address1 = pref + cityPart;
+            address2 = buildingMatch[1];
+            address3 = buildingMatch[2];      // 建物名
+          } else {
+            address1 = pref + cityPart;
+            address2 = streetAndBuilding;
+            address3 = '';
+          }
+        } else {
+          address1 = pref + rest;
+          address2 = '';
+          address3 = '';
+        }
       } else {
         address1 = addrBody;
+        address2 = '';
+        address3 = '';
       }
     }
 
@@ -568,7 +629,8 @@
     });
     const productsWithImages = await Promise.all(
       productPromises.map(async p => {
-        const imgSrc = p.productId ? await fetchProductImage(p.productId) : '';
+        const imgUrl = p.productId ? await fetchProductImage(p.productId) : '';
+        const imgSrc = imgUrl ? await fetchImageAsBase64(imgUrl) : '';
         return { name: p.productName, setName: p.setName || '', quantity: p.quantity, imgSrc, productId: p.productId };
       })
     );
@@ -578,7 +640,7 @@
     const hasColdProduct = products.some(p => p.productId && COLD_PRODUCT_IDS.has(p.productId));
     const hasCoolPrepaid = products.some(p => p.productId && COOL_PREPAID_IDS.has(p.productId));
     const finalDeliveryGroup = hasColdProduct ? '輸入代行費グループA' : hasCoolPrepaid ? 'ヤマトクール元払い' : '';
-    return { logisticsId, orderCode: orderCodeFromPage, companyName: companyName || '（会社名取得中）', deliveryGroup: finalDeliveryGroup, personName, tel, zip, address1, address2, products };
+    return { logisticsId, orderCode: orderCodeFromPage, companyName: companyName || '（会社名取得中）', deliveryGroup: finalDeliveryGroup, personName, tel, zip, address1, address2, address3: address3||'', products };
   }
 
   // 発送指示書HTML生成
@@ -843,7 +905,7 @@
       if (win) { await new Promise(r => setTimeout(r, 2000)); win.print(); }
       // GASにシート記録＋メール通知
       statusDiv.textContent = '📨 記録・通知中…';
-      notifyGAS(orders);
+      notifyGAS(orders, html);
       statusDiv.textContent = `✅ ${orders.length}件の発送指示書を生成しました`;
       orderInstBtn.disabled = false;
     });
@@ -871,21 +933,49 @@
     if (win) { await new Promise(r => setTimeout(r, 2000)); win.print(); } else { statusDiv.textContent = '⚠️ ポップアップがブロックされています'; }
     // GASにシート記録＋メール通知
     statusDiv.textContent = '📨 記録・通知中…';
-    notifyGAS(orders);
+    notifyGAS(orders, html);
     statusDiv.textContent = `✅ ${orders.length}件の発送指示書を生成しました`;
     btn.disabled = false; printOneBtn.disabled = printAllBtn.disabled = printChecked.disabled = false;
   });
+
+  // 納品書PDF＋発送指示書を合体して印刷
+  async function printWithShippingInstruction(ids) {
+    const pdfBuffers = [];
+    const orders = [];
+    for (let i = 0; i < ids.length; i++) {
+      statusDiv.textContent = `🖨 生成中… (${i + 1}/${ids.length}) ID: ${ids[i]}`;
+      try {
+        pdfBuffers.push(await generateDeliveryNotePDF(ids[i], true));
+        const detail = await fetchLogisticsDetail(ids[i]);
+        orders.push(detail);
+      } catch(e) { console.error('取得エラー:', ids[i], e); }
+      await new Promise(r => setTimeout(r, 500));
+    }
+    if (!pdfBuffers.length) { statusDiv.textContent = '⚠️ 生成に失敗しました'; return; }
+
+    // 納品書PDFをまとめて印刷
+    statusDiv.textContent = '🖨 PDF結合中…';
+    const pdfUrl = await mergePDFBuffers(pdfBuffers);
+    statusDiv.textContent = '🖨 印刷ダイアログを表示します…';
+    const w = window.open(pdfUrl, '_blank');
+    if (!w) { statusDiv.textContent = '⚠️ ポップアップがブロックされています'; return; }
+    await new Promise(r => setTimeout(r, 2500));
+    try { w.print(); } catch(e) {}
+
+    // GASに発送指示書PDF＋CSVをメール送信
+    if (orders.length) {
+      statusDiv.textContent = '📨 記録・通知中…';
+      const instHtml = generateShippingInstructionHTML(orders);
+      notifyGAS(orders, instHtml);
+    }
+  }
 
   // 印刷ボタン
   printOneBtn.addEventListener('click', async () => {
     const ids = getVisibleLogisticsIds();
     if (!ids.length) { statusDiv.textContent = '⚠️ 発送IDが見つかりません'; return; }
     printOneBtn.disabled = printAllBtn.disabled = printChecked.disabled = true;
-    for (let i = 0; i < ids.length; i++) {
-      statusDiv.textContent = `🖨 印刷中… (${i + 1}/${ids.length})`;
-      try { const url = await generateDeliveryNotePDF(ids[i]); const w = window.open(url, '_blank'); if (w) { await new Promise(r => setTimeout(r, 2000)); w.print(); await new Promise(r => setTimeout(r, 1000)); URL.revokeObjectURL(url); } } catch(e) {}
-      await new Promise(r => setTimeout(r, 800));
-    }
+    await printWithShippingInstruction(ids);
     statusDiv.textContent = `✅ ${ids.length}件 印刷完了`;
     printOneBtn.disabled = printAllBtn.disabled = printChecked.disabled = false;
   });
@@ -893,7 +983,7 @@
     const ids = getVisibleLogisticsIds();
     if (!ids.length) { statusDiv.textContent = '⚠️ 発送IDが見つかりません'; return; }
     printOneBtn.disabled = printAllBtn.disabled = printChecked.disabled = true;
-    await printMergedPDFs(ids);
+    await printWithShippingInstruction(ids);
     statusDiv.textContent = `✅ ${ids.length}件 印刷完了`;
     printOneBtn.disabled = printAllBtn.disabled = printChecked.disabled = false;
   });
@@ -901,7 +991,7 @@
     const ids = getCheckedLogisticsIds();
     if (!ids.length) { statusDiv.textContent = '⚠️ チェックされた発送IDがありません'; return; }
     printOneBtn.disabled = printAllBtn.disabled = printChecked.disabled = true;
-    await printMergedPDFs(ids);
+    await printWithShippingInstruction(ids);
     statusDiv.textContent = `✅ ${ids.length}件 印刷完了`;
     printOneBtn.disabled = printAllBtn.disabled = printChecked.disabled = false;
   });
