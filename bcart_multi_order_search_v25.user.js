@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bカート 複数受注番号まとめて検索 v25（発送指示書デザイン統合）
 // @namespace    http://tampermonkey.net/
-// @version      25.35
+// @version      25.39
 // @description  複数受注番号の絞り込み・納品書印刷・ドラッグ移動・ポップアップ時自動非表示
 // @author       You
 // @match        https://*.bcart.jp/admin/order*
@@ -164,6 +164,10 @@
       <div class="bcart-tab-content active" id="tab-text">
         <textarea id="bcart-text-input" placeholder="例：&#10;17790995019&#10;20003182&#10;（受注番号・発送ID両対応）"></textarea>
         <div class="bcart-hint">※ 1行に1つ入力（受注番号・発送ID混在OK）</div>
+        <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:#475569;margin-top:4px;">
+          <input type="checkbox" id="bcart-exclude-shipped" style="width:14px;height:14px;">
+          発送済みを除外する
+        </label>
       </div>
       <div class="bcart-tab-content" id="tab-csv">
         <div id="bcart-drop-area">
@@ -425,7 +429,12 @@
         const param = isLogisticsId ? `logistics_id=${encodeURIComponent(num)}` : `order_code=${encodeURIComponent(num)}`;
         const res = await fetch(`${base}?${param}`, { credentials: 'same-origin' });
         const doc = new DOMParser().parseFromString(await res.text(), 'text/html');
-        doc.querySelectorAll('table tbody tr').forEach(r => { if (r.textContent.includes(num)) allRows.push(r.outerHTML); });
+        doc.querySelectorAll('table tbody tr').forEach(r => {
+          // 発送済み除外チェックがONの場合、発送済み行をスキップ
+          const excludeShipped = document.getElementById('bcart-exclude-shipped')?.checked;
+          if (excludeShipped && r.innerHTML.includes('change_logistics_status_disabled')) return;
+          if (r.textContent.includes(num)) allRows.push(r.outerHTML);
+        });
       } catch(e) {}
       await new Promise(r => setTimeout(r, 300));
     }
