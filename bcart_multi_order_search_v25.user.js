@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bカート 複数受注番号まとめて検索 v25（発送指示書デザイン統合）
 // @namespace    http://tampermonkey.net/
-// @version      25.39
+// @version      25.40
 // @description  複数受注番号の絞り込み・納品書印刷・ドラッグ移動・ポップアップ時自動非表示
 // @author       You
 // @match        https://*.bcart.jp/admin/order*
@@ -194,10 +194,6 @@
         <button class="bcart-print-btn" id="bcart-shipping-inst" style="width:100%;background:linear-gradient(135deg,#7c3aed,#5b21b6);color:white;">☑ チェックした件の発送指示書を作成</button>
       </div>
       <button id="bcart-reset-btn">✕ 絞り込みを解除する</button>
-      <div id="bcart-order-inst-area" style="display:none;margin-top:10px;">
-        <div class="print-title">📋 発送指示書（受注一覧）</div>
-        <button class="bcart-print-btn" id="bcart-order-shipping-inst" style="width:100%;background:linear-gradient(135deg,#7c3aed,#5b21b6);color:white;margin-top:6px;">☑ チェックした件の発送指示書を作成</button>
-      </div>
     </div>
   `;
   document.body.appendChild(panel);
@@ -424,13 +420,12 @@
       progressBar.style.width = `${Math.round((i + 1) / orderNumbers.length * 100)}%`;
       try {
         const num = orderNumbers[i];
-        const isLogisticsId = /^\d{8}$/.test(num); // 8桁 → 発送ID
+        const isLogisticsId = /^\d{8}$/.test(num);
         const base = location.pathname.includes('logistics') ? '/admin/logistics/list' : '/admin/order/list';
         const param = isLogisticsId ? `logistics_id=${encodeURIComponent(num)}` : `order_code=${encodeURIComponent(num)}`;
         const res = await fetch(`${base}?${param}`, { credentials: 'same-origin' });
         const doc = new DOMParser().parseFromString(await res.text(), 'text/html');
         doc.querySelectorAll('table tbody tr').forEach(r => {
-          // 発送済み除外チェックがONの場合、発送済み行をスキップ
           const excludeShipped = document.getElementById('bcart-exclude-shipped')?.checked;
           if (excludeShipped && r.innerHTML.includes('change_logistics_status_disabled')) return;
           if (r.textContent.includes(num)) allRows.push(r.outerHTML);
@@ -536,38 +531,31 @@
     let personName = '', tel = '', zip = '', address1 = '', address2 = '', address3 = '';
     const allTds = doc.querySelectorAll('td');
 
-    // tdインデックスで直接取得（ラベルなし構造）
-    // [7]=電話番号 [10]=配送グループ [14]=会社名 [15]=担当者 [16]=住所
     if (allTds[7])  tel          = allTds[7].textContent.trim().replace(/\s+/g,'');
     if (allTds[10]) deliveryGroup= allTds[10].textContent.trim();
     if (allTds[14]) companyName  = allTds[14].textContent.trim();
     if (allTds[15]) personName   = allTds[15].textContent.trim();
     if (allTds[16]) {
       const addrText = allTds[16].textContent.replace(/\s+/g,'').trim();
-      // 郵便番号抽出（ハイフンあり形式で保持）
       const zipMatch = addrText.match(/〒?(\d{3})-?(\d{4})/);
       if (zipMatch) zip = zipMatch[1] + '-' + zipMatch[2];
-      // 郵便番号を除いた住所本体
       const addrBody = addrText.replace(/〒?\d{3}-?\d{4}/, '').trim();
-      // 都道府県+市区町村 / 番地 / 建物名に3分割
       const prefMatch = addrBody.match(/^(北海道|東京都|京都府|大阪府|.{2,3}県)(.+)/);
       if (prefMatch) {
         const pref = prefMatch[1];
         const rest = prefMatch[2];
-        // 番地パターン（数字-数字）で分割
         const streetMatch = rest.match(/^(.+?)((?:\d+[-－]\d+(?:[-－]\d+)?).*)$/);
         if (streetMatch) {
-          const cityPart = streetMatch[1]; // 市区町村
+          const cityPart = streetMatch[1];
           const streetAndBuilding = streetMatch[2];
-          // 番地と建物名を分割
           const buildingMatch = streetAndBuilding.match(/^(\d+[-－]\d+(?:[-－]\d+)?)(.*)$/);
           if (buildingMatch) {
-            address1 = pref + cityPart;      // 都道府県+市区町村
-            address2 = buildingMatch[1];      // 番地
-            address2 = pref + cityPart + buildingMatch[1]; // ゆうプリR[15]用: 都道府県〜番地
             address1 = pref + cityPart;
             address2 = buildingMatch[1];
-            address3 = buildingMatch[2];      // 建物名
+            address2 = pref + cityPart + buildingMatch[1];
+            address1 = pref + cityPart;
+            address2 = buildingMatch[1];
+            address3 = buildingMatch[2];
           } else {
             address1 = pref + cityPart;
             address2 = streetAndBuilding;
@@ -585,7 +573,6 @@
       }
     }
 
-    // ラベルベースでも補完（念のため）
     allTds.forEach((td, i) => {
       const label = td.textContent.trim();
       const next = allTds[i+1];
@@ -620,15 +607,11 @@
       const productId = match ? match[1] : '';
       const productName = productLink.textContent.trim().replace(/\s+/g, ' ');
       if (!productName) return;
-
-      // セット名はセル[1]のテキスト
       let setName = '';
       if (cells[1]) {
         const setTxt = cells[1].textContent.trim().replace(/\s+/g, ' ');
-        // 商品名と異なる場合のみセット名として使用
         if (setTxt && setTxt !== productName) setName = setTxt;
       }
-
       let quantity = '1';
       cells.forEach(cell => {
         const txt = cell.textContent.trim();
@@ -645,7 +628,6 @@
     );
     products.push(...productsWithImages.filter(p => p.name && p.name.length > 0));
 
-    // 冷蔵判定: 商品IDリストにある商品が含まれる場合のみ冷蔵（配送グループは無視）
     const hasColdProduct = products.some(p => p.productId && COLD_PRODUCT_IDS.has(p.productId));
     const hasCoolPrepaid = products.some(p => p.productId && COOL_PREPAID_IDS.has(p.productId));
     const finalDeliveryGroup = hasColdProduct ? '輸入代行費グループA' : hasCoolPrepaid ? 'ヤマトクール元払い' : '';
@@ -659,8 +641,6 @@
 
     orders.forEach(order => {
       const prods = order.products || [];
-
-      // 商品を3グループに分割（productIdを文字列化して比較）
       const normalProds = prods.filter(p => !COLD_PRODUCT_IDS.has(String(p.productId)) && !COOL_PREPAID_IDS.has(String(p.productId)));
       const coolProds   = prods.filter(p => COOL_PREPAID_IDS.has(String(p.productId)));
       const coldProds   = prods.filter(p => COLD_PRODUCT_IDS.has(String(p.productId)));
@@ -686,7 +666,6 @@
     const coolOrders   = flatOrders.filter(o => (o.deliveryGroup||'').includes('ヤマトクール元払い'));
     const normalOrders = flatOrders.filter(o => !(o.deliveryGroup||'').includes('輸入代行費グループA') && !(o.deliveryGroup||'').includes('ヤマトクール元払い'));
     function layoutOrders(orderList) {
-      // 合計商品数が3以内なら同居、3商品以上の受注は単独ページ
       const MAX_PRODUCTS = 3;
       const result = [];
       let buf = [], bufTotal = 0;
@@ -849,78 +828,7 @@
 </style></head><body>${pagesHTML}</body></html>`;
   }
 
-  // 受注詳細取得
-  async function fetchOrderDetail(orderInternalId) {
-    const res = await fetch(`${location.origin}/admin/order/${orderInternalId}/view`, { credentials: 'same-origin' });
-    const text = await res.text();
-    const doc = new DOMParser().parseFromString(text, 'text/html');
-    let companyName = '', address = '';
-    const products = [];
-    doc.querySelectorAll('table').forEach(table => {
-      table.querySelectorAll('tr').forEach(row => {
-        const th = row.querySelector('th, td:first-child'), td = row.querySelector('td:last-child');
-        if (!th || !td) return;
-        const label = th.textContent.trim(), value = td.textContent.trim();
-        if (label.includes('会社名') || label.includes('会員名')) companyName = companyName || value;
-        if (label.includes('配送先') || label.includes('住所') || label.includes('宛先')) address = address || value;
-      });
-    });
-    doc.querySelectorAll('table tbody tr').forEach(row => {
-      const img = row.querySelector('img');
-      const imgSrc = img ? (img.src.startsWith('http') ? img.src : location.origin + img.getAttribute('src')) : '';
-      const cells = row.querySelectorAll('td');
-      if (cells.length < 2) return;
-      let productName = '', quantity = '';
-      cells.forEach(cell => {
-        const text = cell.textContent.trim();
-        if (text.length > 3 && !text.match(/^[\d,¥]+$/) && !text.match(/^[\s]+$/)) { if (!productName) productName = text; }
-        if (text.match(/^\d+$/) && parseInt(text) < 10000) quantity = text;
-      });
-      if (productName && productName.length > 2) products.push({ name: productName, quantity: quantity || '1', imgSrc });
-    });
-    return { companyName, address, products };
-  }
-
-  function getCheckedOrderInternalIds() {
-    const ids = [];
-    document.querySelectorAll('table tbody tr').forEach(row => {
-      const cb = row.querySelector('input[type="checkbox"]'); if (!cb || !cb.checked) return;
-      for (const link of row.querySelectorAll('a')) {
-        const match = (link.href || '').match(/\/admin\/order\/(\d+)\/view/);
-        if (match) { if (!ids.includes(match[1])) ids.push(match[1]); return; }
-      }
-    });
-    return ids;
-  }
-
-  // 受注一覧用発送指示書ボタン
-  const orderInstBtn = document.getElementById('bcart-order-shipping-inst');
-  if (orderInstBtn) {
-    orderInstBtn.addEventListener('click', async () => {
-      const internalIds = getCheckedOrderInternalIds();
-      if (!internalIds.length) { statusDiv.textContent = '⚠️ チェックされた受注がありません'; return; }
-      orderInstBtn.disabled = true;
-      const orders = [];
-      for (let i = 0; i < internalIds.length; i++) {
-        statusDiv.textContent = `📋 情報取得中… (${i + 1}/${internalIds.length})`;
-        try { const detail = await fetchOrderDetail(internalIds[i]); orders.push({ ...detail, logisticsId: internalIds[i] }); } catch(e) { console.error('取得エラー:', e); }
-        await new Promise(r => setTimeout(r, 400));
-      }
-      if (!orders.length) { statusDiv.textContent = '⚠️ 情報の取得に失敗しました'; orderInstBtn.disabled = false; return; }
-      statusDiv.textContent = '📋 発送指示書を生成中…';
-      const html = generateShippingInstructionHTML(orders);
-      const url = URL.createObjectURL(new Blob([html], { type: 'text/html;charset=utf-8' }));
-      const win = window.open(url, '_blank');
-      if (win) { await new Promise(r => setTimeout(r, 2000)); win.print(); }
-      // GASにシート記録＋メール通知
-      statusDiv.textContent = '📨 記録・通知中…';
-      notifyGAS(orders, html);
-      statusDiv.textContent = `✅ ${orders.length}件の発送指示書を生成しました`;
-      orderInstBtn.disabled = false;
-    });
-  }
-
-  // 発送指示書ボタン（出荷一覧）
+  // 発送指示書ボタン（出荷一覧のみ）
   document.getElementById('bcart-shipping-inst').addEventListener('click', async () => {
     const items = getCheckedLogisticsWithOrderCode();
     if (!items.length) { statusDiv.textContent = '⚠️ チェックされた発送IDがありません'; return; }
@@ -940,7 +848,6 @@
     const url = URL.createObjectURL(new Blob([html], { type: 'text/html;charset=utf-8' }));
     const win = window.open(url, '_blank');
     if (win) { await new Promise(r => setTimeout(r, 2000)); win.print(); } else { statusDiv.textContent = '⚠️ ポップアップがブロックされています'; }
-    // GASにシート記録＋メール通知
     statusDiv.textContent = '📨 記録・通知中…';
     notifyGAS(orders, html);
     statusDiv.textContent = `✅ ${orders.length}件の発送指示書を生成しました`;
@@ -962,7 +869,6 @@
     }
     if (!pdfBuffers.length) { statusDiv.textContent = '⚠️ 生成に失敗しました'; return; }
 
-    // 納品書PDFをまとめて印刷
     statusDiv.textContent = '🖨 PDF結合中…';
     const pdfUrl = await mergePDFBuffers(pdfBuffers);
     statusDiv.textContent = '🖨 印刷ダイアログを表示します…';
@@ -971,7 +877,6 @@
     await new Promise(r => setTimeout(r, 2500));
     try { w.print(); } catch(e) {}
 
-    // GASに発送指示書PDF＋CSVをメール送信
     if (orders.length) {
       statusDiv.textContent = '📨 記録・通知中…';
       const instHtml = generateShippingInstructionHTML(orders);
@@ -1013,8 +918,6 @@
   }
   async function onPageReady() {
     if (location.pathname.includes('logistics')) printArea.style.display = 'block';
-    const orderInstArea = document.getElementById('bcart-order-inst-area');
-    if (orderInstArea && location.pathname.includes('/order')) orderInstArea.style.display = 'block';
     const saved = loadState();
     if (saved && saved.orderNumbers && saved.orderNumbers.length) {
       restoreBanner.style.display = 'block'; restoreBanner.textContent = `🔄 前回の絞り込み（${saved.orderNumbers.length}件）を復元中…`;
