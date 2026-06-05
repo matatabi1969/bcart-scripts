@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bカート 複数受注番号まとめて検索 v25（発送指示書デザイン統合）
 // @namespace    http://tampermonkey.net/
-// @version      25.41
+// @version      25.42
 // @description  複数受注番号の絞り込み・納品書印刷・ドラッグ移動・ポップアップ時自動非表示
 // @author       You
 // @match        https://*.bcart.jp/admin/order*
@@ -415,7 +415,13 @@
   function getCheckedLogisticsIds() {
     const ids = [];
     document.querySelectorAll('table tbody tr').forEach(row => {
-      const cb = row.querySelector('input[type="checkbox"]'); if (!cb || !cb.checked) return;
+      // name="id_check[]" のチェックボックスを優先
+      const cb = row.querySelector('input[name="id_check[]"], input[type="checkbox"]');
+      if (!cb || !cb.checked) return;
+      // チェックボックスのvalue（発送ID）を直接使う
+      if (cb.name === 'id_check[]' && cb.value && !ids.includes(cb.value)) {
+        ids.push(cb.value); return;
+      }
       for (const a of row.querySelectorAll('a')) { if (/^\d{8}$/.test(a.textContent.trim())) { if (!ids.includes(a.textContent.trim())) ids.push(a.textContent.trim()); return; } }
       for (const td of row.querySelectorAll('td')) { if (/^\d{8}$/.test(td.textContent.trim())) { if (!ids.includes(td.textContent.trim())) ids.push(td.textContent.trim()); return; } }
     });
@@ -953,7 +959,12 @@
   // =============================================
 
   // 日付をYYYY-MM-DD形式で返す
+  // YYYY/MM/DD形式（Bカートの日付形式）
   function formatDate(d) {
+    return d.getFullYear() + '/' + String(d.getMonth()+1).padStart(2,'0') + '/' + String(d.getDate()).padStart(2,'0');
+  }
+  // input[type=date]用のYYYY-MM-DD形式
+  function formatDateInput(d) {
     return d.getFullYear() + '-' + String(d.getMonth()+1).padStart(2,'0') + '-' + String(d.getDate()).padStart(2,'0');
   }
 
@@ -963,25 +974,31 @@
     const tomorrow = new Date(today); tomorrow.setDate(today.getDate() + 1);
     const shipInput    = document.getElementById('bcart-ship-date');
     const arrivalInput = document.getElementById('bcart-arrival-date');
-    if (shipInput)    shipInput.value    = formatDate(today);
-    if (arrivalInput) arrivalInput.value = formatDate(tomorrow);
+    if (shipInput)    shipInput.value    = formatDateInput(today);
+    if (arrivalInput) arrivalInput.value = formatDateInput(tomorrow);
   }
 
   // 発送日・納品日を1件の発送IDに設定（fetch POST）
   async function applyDateToLogistics(logisticsId, shipDate, arrivalDate) {
-    // まず編集ページを取得してCSRFトークンと既存データを取得
+    // 編集ページを取得してフォームの既存値とCSRFトークンを取得
     const viewRes = await fetch(`${location.origin}/admin/logistics/${logisticsId}/edit`, { credentials: 'same-origin' });
     const viewText = await viewRes.text();
     const viewDoc = new DOMParser().parseFromString(viewText, 'text/html');
 
-    const fd = new FormData();
-    fd.append('_token', getCsrfToken());
-    fd.append('_method', 'PUT');
+    // フォームのaction URLを取得
+    const form = viewDoc.querySelector('form');
+    if (!form) throw new Error('フォームが見つかりません');
 
-    // 既存フォームの値をそのままコピー（上書き防止）
+    const fd = new FormData();
+
+    // CSRFトークン
+    const tokenEl = viewDoc.querySelector('input[name="_token"]');
+    fd.append('_token', tokenEl ? tokenEl.value : getCsrfToken());
+
+    // 既存フォームの値をコピー
     viewDoc.querySelectorAll('input[name], select[name], textarea[name]').forEach(el => {
       const name = el.name;
-      if (!name || name === '_token' || name === '_method') return;
+      if (!name || name === '_token') return;
       if (el.type === 'checkbox' || el.type === 'radio') {
         if (el.checked) fd.append(name, el.value);
       } else {
@@ -989,12 +1006,13 @@
       }
     });
 
-    // 発送日・納品日を上書き
+    // 発送日・納品日をYYYY/MM/DD形式で上書き
     if (shipDate) {
-      fd.set('delivery_date', shipDate);
+      // input[type=date]の値(YYYY-MM-DD)をYYYY/MM/DDに変換
+      fd.set('delivery_date', shipDate.replace(/-/g, '/'));
     }
     if (arrivalDate) {
-      fd.set('arrival_date', arrivalDate);
+      fd.set('arrival_date', arrivalDate.replace(/-/g, '/'));
     }
 
     const res = await fetch(`${location.origin}/admin/logistics/${logisticsId}/edit`, {
