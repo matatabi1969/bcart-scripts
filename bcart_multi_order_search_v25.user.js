@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bカート 複数受注番号まとめて検索 v25（発送指示書デザイン統合）
 // @namespace    http://tampermonkey.net/
-// @version      25.40
+// @version      25.41
 // @description  複数受注番号の絞り込み・納品書印刷・ドラッグ移動・ポップアップ時自動非表示
 // @author       You
 // @match        https://*.bcart.jp/admin/order*
@@ -145,6 +145,29 @@
     }
     .bcart-filtered-out { display: none !important; }
     .bcart-highlight td { background: #eff6ff !important; }
+    .bcart-date-area { margin-top: 10px; }
+    .bcart-date-area .print-title { font-size: 11px; color: #475569; font-weight: bold; margin-bottom: 6px; text-align: center; }
+    #bcart-date-picker {
+      display: none; background: #f8fafc; border: 1.5px solid #e2e8f0;
+      border-radius: 8px; padding: 10px 12px; margin-top: 6px;
+    }
+    .bcart-date-row {
+      display: flex; align-items: center; gap: 6px; margin-bottom: 8px; font-size: 12px;
+    }
+    .bcart-date-row label { color: #475569; font-weight: bold; min-width: 44px; }
+    .bcart-date-input {
+      flex: 1; border: 1px solid #cbd5e1; border-radius: 5px;
+      padding: 5px 8px; font-size: 12px; color: #1e293b; outline: none;
+    }
+    .bcart-date-input:focus { border-color: #3a7bd5; }
+    #bcart-date-apply-btn {
+      width: 100%; background: linear-gradient(135deg, #0891b2, #0e7490);
+      color: white; border: none; border-radius: 6px; padding: 8px 0;
+      font-size: 12px; font-weight: bold; cursor: pointer; margin-top: 2px;
+    }
+    #bcart-date-apply-btn:hover { opacity: 0.88; }
+    #bcart-date-apply-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+
   `;
   document.head.appendChild(style);
 
@@ -192,6 +215,21 @@
         <button class="bcart-print-btn checked" id="bcart-print-checked">☑ チェックした件を印刷</button>
         <div class="print-title" style="margin-top:10px;">📋 発送指示書</div>
         <button class="bcart-print-btn" id="bcart-shipping-inst" style="width:100%;background:linear-gradient(135deg,#7c3aed,#5b21b6);color:white;">☑ チェックした件の発送指示書を作成</button>
+      </div>
+      <div class="bcart-date-area" id="bcart-date-area" style="display:none;">
+        <div class="print-title">📅 発送日・納品日を設定</div>
+        <button class="bcart-print-btn" id="bcart-date-open-btn" style="width:100%;background:linear-gradient(135deg,#0891b2,#0e7490);color:white;">📅 日付を設定する</button>
+        <div id="bcart-date-picker">
+          <div class="bcart-date-row">
+            <label>発送日</label>
+            <input type="date" class="bcart-date-input" id="bcart-ship-date">
+          </div>
+          <div class="bcart-date-row">
+            <label>納品日</label>
+            <input type="date" class="bcart-date-input" id="bcart-arrival-date">
+          </div>
+          <button id="bcart-date-apply-btn">✓ チェックした件に適用</button>
+        </div>
       </div>
       <button id="bcart-reset-btn">✕ 絞り込みを解除する</button>
     </div>
@@ -910,6 +948,114 @@
     printOneBtn.disabled = printAllBtn.disabled = printChecked.disabled = false;
   });
 
+  // =============================================
+  // 発送日・納品日一括設定
+  // =============================================
+
+  // 日付をYYYY-MM-DD形式で返す
+  function formatDate(d) {
+    return d.getFullYear() + '-' + String(d.getMonth()+1).padStart(2,'0') + '-' + String(d.getDate()).padStart(2,'0');
+  }
+
+  // デフォルト日付をセット（当日・翌日）
+  function initDatePicker() {
+    const today = new Date();
+    const tomorrow = new Date(today); tomorrow.setDate(today.getDate() + 1);
+    const shipInput    = document.getElementById('bcart-ship-date');
+    const arrivalInput = document.getElementById('bcart-arrival-date');
+    if (shipInput)    shipInput.value    = formatDate(today);
+    if (arrivalInput) arrivalInput.value = formatDate(tomorrow);
+  }
+
+  // 発送日・納品日を1件の発送IDに設定（fetch POST）
+  async function applyDateToLogistics(logisticsId, shipDate, arrivalDate) {
+    // まず編集ページを取得してCSRFトークンと既存データを取得
+    const viewRes = await fetch(`${location.origin}/admin/logistics/${logisticsId}/edit`, { credentials: 'same-origin' });
+    const viewText = await viewRes.text();
+    const viewDoc = new DOMParser().parseFromString(viewText, 'text/html');
+
+    const fd = new FormData();
+    fd.append('_token', getCsrfToken());
+    fd.append('_method', 'PUT');
+
+    // 既存フォームの値をそのままコピー（上書き防止）
+    viewDoc.querySelectorAll('input[name], select[name], textarea[name]').forEach(el => {
+      const name = el.name;
+      if (!name || name === '_token' || name === '_method') return;
+      if (el.type === 'checkbox' || el.type === 'radio') {
+        if (el.checked) fd.append(name, el.value);
+      } else {
+        fd.append(name, el.value || '');
+      }
+    });
+
+    // 発送日・納品日を上書き
+    if (shipDate) {
+      fd.set('delivery_date', shipDate);
+    }
+    if (arrivalDate) {
+      fd.set('arrival_date', arrivalDate);
+    }
+
+    const res = await fetch(`${location.origin}/admin/logistics/${logisticsId}/edit`, {
+      method: 'POST',
+      credentials: 'same-origin',
+      body: fd,
+    });
+    return res.ok;
+  }
+
+  // 日付設定ボタンの開閉
+  const dateOpenBtn   = document.getElementById('bcart-date-open-btn');
+  const datePicker    = document.getElementById('bcart-date-picker');
+  const dateApplyBtn  = document.getElementById('bcart-date-apply-btn');
+
+  if (dateOpenBtn) {
+    dateOpenBtn.addEventListener('click', () => {
+      const isOpen = datePicker.style.display !== 'none';
+      datePicker.style.display = isOpen ? 'none' : 'block';
+      if (!isOpen) initDatePicker();
+    });
+  }
+
+  if (dateApplyBtn) {
+    dateApplyBtn.addEventListener('click', async () => {
+      const shipDate    = document.getElementById('bcart-ship-date').value;
+      const arrivalDate = document.getElementById('bcart-arrival-date').value;
+
+      if (!shipDate && !arrivalDate) {
+        statusDiv.textContent = '⚠️ 発送日または納品日を入力してください';
+        return;
+      }
+
+      const ids = getCheckedLogisticsIds();
+      if (!ids.length) {
+        statusDiv.textContent = '⚠️ チェックされた発送IDがありません';
+        return;
+      }
+
+      dateApplyBtn.disabled = true;
+      let successCount = 0;
+
+      for (let i = 0; i < ids.length; i++) {
+        statusDiv.textContent = `📅 日付設定中… (${i+1}/${ids.length}) ID: ${ids[i]}`;
+        try {
+          const ok = await applyDateToLogistics(ids[i], shipDate, arrivalDate);
+          if (ok) successCount++;
+        } catch(e) {
+          console.error('日付設定エラー:', ids[i], e);
+        }
+        await new Promise(r => setTimeout(r, 400));
+      }
+
+      statusDiv.textContent = `✅ ${successCount}件に日付を設定しました`;
+      dateApplyBtn.disabled = false;
+      datePicker.style.display = 'none';
+    });
+  }
+
+
+
   // ページ読み込み
   async function waitForTable(maxWait = 5000) {
     const start = Date.now();
@@ -917,7 +1063,11 @@
     return false;
   }
   async function onPageReady() {
-    if (location.pathname.includes('logistics')) printArea.style.display = 'block';
+    if (location.pathname.includes('logistics')) {
+      printArea.style.display = 'block';
+      const dateArea = document.getElementById('bcart-date-area');
+      if (dateArea) dateArea.style.display = 'block';
+    }
     const saved = loadState();
     if (saved && saved.orderNumbers && saved.orderNumbers.length) {
       restoreBanner.style.display = 'block'; restoreBanner.textContent = `🔄 前回の絞り込み（${saved.orderNumbers.length}件）を復元中…`;
@@ -931,7 +1081,11 @@
   window.addEventListener('pageshow', () => {
     pageReadyDone = false;
     setTimeout(async () => {
-      if (location.pathname.includes('logistics')) printArea.style.display = 'block';
+      if (location.pathname.includes('logistics')) {
+        printArea.style.display = 'block';
+        const dateArea = document.getElementById('bcart-date-area');
+        if (dateArea) dateArea.style.display = 'block';
+      }
       const saved = loadState();
       if (saved && saved.orderNumbers && saved.orderNumbers.length) {
         restoreBanner.style.display = 'block'; restoreBanner.textContent = `🔄 前回の絞り込み（${saved.orderNumbers.length}件）を復元中…`;
