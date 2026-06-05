@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bカート 複数受注番号まとめて検索 v25（発送指示書デザイン統合）
 // @namespace    http://tampermonkey.net/
-// @version      25.50
+// @version      25.51
 // @description  複数受注番号の絞り込み・納品書印刷・ドラッグ移動・ポップアップ時自動非表示
 // @author       You
 // @match        https://*.bcart.jp/admin/order*
@@ -39,26 +39,17 @@
         })),
         shippingHtml: shippingHtml || '',
       });
-      const form = document.createElement('form');
-      form.method = 'POST';
-      form.action = GAS_URL;
-      form.target = 'gas_iframe_' + Date.now();
-      form.style.display = 'none';
-      const input = document.createElement('input');
-      input.type = 'hidden';
-      input.name = 'payload';
-      input.value = payload;
-      form.appendChild(input);
-      const iframe = document.createElement('iframe');
-      iframe.name = form.target;
-      iframe.style.display = 'none';
-      document.body.appendChild(iframe);
-      document.body.appendChild(form);
-      form.submit();
-      setTimeout(() => {
-        try { document.body.removeChild(form); document.body.removeChild(iframe); } catch(e) {}
-      }, 5000);
-      console.log('[GAS通知] POST送信:', orders.length, '件');
+      // fetchでPOST送信（form/iframe方式を廃止）
+      fetch(GAS_URL, {
+        method: 'POST',
+        mode: 'no-cors',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: 'payload=' + encodeURIComponent(payload),
+      }).then(() => {
+        console.log('[GAS通知] 送信完了:', orders.length, '件');
+      }).catch(e => {
+        console.error('[GAS通知] エラー:', e);
+      });
     } catch(e) {
       console.error('[GAS通知] エラー:', e);
     }
