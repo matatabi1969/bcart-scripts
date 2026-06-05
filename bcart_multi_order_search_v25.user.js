@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bカート 複数受注番号まとめて検索 v25（発送指示書デザイン統合）
 // @namespace    http://tampermonkey.net/
-// @version      25.42
+// @version      25.50
 // @description  複数受注番号の絞り込み・納品書印刷・ドラッグ移動・ポップアップ時自動非表示
 // @author       You
 // @match        https://*.bcart.jp/admin/order*
@@ -229,6 +229,27 @@
             <input type="date" class="bcart-date-input" id="bcart-arrival-date">
           </div>
           <button id="bcart-date-apply-btn">✓ チェックした件に適用</button>
+        </div>
+      </div>
+      <div id="bcart-unpaid-area" style="display:none;margin-top:10px;">
+        <div class="print-title">💰 未入金を検索</div>
+        <button class="bcart-print-btn" id="bcart-unpaid-open-btn" style="width:100%;background:linear-gradient(135deg,#dc2626,#b91c1c);color:white;">💰 未入金を全件抽出</button>
+        <div id="bcart-unpaid-picker" style="display:none;background:#f8fafc;border:1.5px solid #e2e8f0;border-radius:8px;padding:10px 12px;margin-top:6px;">
+          <div class="bcart-date-row">
+            <label style="min-width:52px;">金額 下限</label>
+            <input type="number" class="bcart-date-input" id="bcart-amount-min" placeholder="例: 10000" min="0">
+            <span style="font-size:11px;color:#64748b;">円以上</span>
+          </div>
+          <div class="bcart-date-row">
+            <label style="min-width:52px;">金額 上限</label>
+            <input type="number" class="bcart-date-input" id="bcart-amount-max" placeholder="上限なし" min="0">
+            <span style="font-size:11px;color:#64748b;">円以下</span>
+          </div>
+          <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:#475569;margin-bottom:8px;">
+            <input type="checkbox" id="bcart-unpaid-bank-only" checked style="width:14px;height:14px;">
+            銀行振込のみ（クレジット除外）
+          </label>
+          <button id="bcart-unpaid-search-btn" style="width:100%;background:linear-gradient(135deg,#dc2626,#b91c1c);color:white;border:none;border-radius:6px;padding:8px 0;font-size:12px;font-weight:bold;cursor:pointer;">🔍 未入金を全件抽出</button>
         </div>
       </div>
       <button id="bcart-reset-btn">✕ 絞り込みを解除する</button>
@@ -466,13 +487,22 @@
         const num = orderNumbers[i];
         const isLogisticsId = /^\d{8}$/.test(num);
         const base = location.pathname.includes('logistics') ? '/admin/logistics/list' : '/admin/order/list';
-        const param = isLogisticsId ? `logistics_id=${encodeURIComponent(num)}` : `order_code=${encodeURIComponent(num)}`;
+        // 出荷一覧の発送IDパラメータは order_logistics_id、受注一覧は order_code
+        let param;
+        if (location.pathname.includes('logistics')) {
+          param = isLogisticsId ? `order_logistics_id=${encodeURIComponent(num)}` : `order_code=${encodeURIComponent(num)}`;
+        } else {
+          param = isLogisticsId ? `logistics_id=${encodeURIComponent(num)}` : `order_code=${encodeURIComponent(num)}`;
+        }
         const res = await fetch(`${base}?${param}`, { credentials: 'same-origin' });
         const doc = new DOMParser().parseFromString(await res.text(), 'text/html');
         doc.querySelectorAll('table tbody tr').forEach(r => {
           const excludeShipped = document.getElementById('bcart-exclude-shipped')?.checked;
           if (excludeShipped && r.innerHTML.includes('change_logistics_status_disabled')) return;
-          if (r.textContent.includes(num)) allRows.push(r.outerHTML);
+          // テキスト全体またはリンクのテキストに番号が含まれるか確認
+          const rowText = r.textContent.replace(/\s+/g, '');
+          const numClean = num.replace(/\s+/g, '');
+          if (rowText.includes(numClean)) allRows.push(r.outerHTML);
         });
       } catch(e) {}
       await new Promise(r => setTimeout(r, 300));
@@ -540,24 +570,34 @@
       const text = await res.text();
       const doc = new DOMParser().parseFromString(text, 'text/html');
       let imgUrl = '';
-      doc.querySelectorAll('input[type="text"], input:not([type])').forEach(input => {
-        const val = (input.value || input.getAttribute('value') || '').trim();
-        if (!imgUrl && val.match(/\.(jpg|jpeg|png|gif|webp)/i)) imgUrl = val;
-      });
+
+      // ① name="image" のinputを直接取得（最優先）
+      const imageInput = doc.querySelector('input[name="image"]');
+      if (imageInput) {
+        const val = imageInput.getAttribute('value') || '';
+        if (val.match(/\.(jpg|jpeg|png|gif|webp)/i)) imgUrl = val;
+      }
+
+      // ② 全inputのvalue属性から画像URLを探す
+      if (!imgUrl) {
+        doc.querySelectorAll('input').forEach(input => {
+          if (imgUrl) return;
+          const val = input.getAttribute('value') || '';
+          if (val.match(/\.(jpg|jpeg|png|gif|webp)/i) && val.startsWith('http')) imgUrl = val;
+        });
+      }
+
+      // ③ img要素のsrcから取得
       if (!imgUrl) {
         doc.querySelectorAll('img').forEach(img => {
+          if (imgUrl) return;
           const src = img.getAttribute('src') || '';
-          if (!imgUrl && src.match(/\.(jpg|jpeg|png|gif|webp)/i) && !src.startsWith('data:') && src.length > 10) {
+          if (src.match(/\.(jpg|jpeg|png|gif|webp)/i) && !src.startsWith('data:') && src.includes('uploads')) {
             imgUrl = src.startsWith('http') ? src : `${location.origin}${src}`;
           }
         });
       }
-      if (!imgUrl) {
-        doc.querySelectorAll('a[href]').forEach(a => {
-          const href = a.getAttribute('href') || '';
-          if (!imgUrl && href.match(/\.(jpg|jpeg|png|gif|webp)/i)) imgUrl = href;
-        });
-      }
+
       productImageCache[productId] = imgUrl;
       return imgUrl;
     } catch(e) {
@@ -892,8 +932,6 @@
     const url = URL.createObjectURL(new Blob([html], { type: 'text/html;charset=utf-8' }));
     const win = window.open(url, '_blank');
     if (win) { await new Promise(r => setTimeout(r, 2000)); win.print(); } else { statusDiv.textContent = '⚠️ ポップアップがブロックされています'; }
-    statusDiv.textContent = '📨 記録・通知中…';
-    notifyGAS(orders, html);
     statusDiv.textContent = `✅ ${orders.length}件の発送指示書を生成しました`;
     btn.disabled = false; printOneBtn.disabled = printAllBtn.disabled = printChecked.disabled = false;
   });
@@ -921,6 +959,7 @@
     await new Promise(r => setTimeout(r, 2500));
     try { w.print(); } catch(e) {}
 
+    // 納品書印刷時にGAS通知
     if (orders.length) {
       statusDiv.textContent = '📨 記録・通知中…';
       const instHtml = generateShippingInstructionHTML(orders);
@@ -1074,6 +1113,140 @@
 
 
 
+  // =============================================
+  // 未入金検索
+  // td[4]=受注総額 td[10]=入金日 td[12]=決済方法
+  // =============================================
+  const unpaidOpenBtn   = document.getElementById('bcart-unpaid-open-btn');
+  const unpaidPicker    = document.getElementById('bcart-unpaid-picker');
+  const unpaidSearchBtn = document.getElementById('bcart-unpaid-search-btn');
+
+  if (unpaidOpenBtn) {
+    unpaidOpenBtn.addEventListener('click', () => {
+      const isOpen = unpaidPicker.style.display !== 'none';
+      unpaidPicker.style.display = isOpen ? 'none' : 'block';
+    });
+  }
+
+  if (unpaidSearchBtn) {
+    unpaidSearchBtn.addEventListener('click', async () => {
+      const amountMin   = parseInt(document.getElementById('bcart-amount-min').value) || 0;
+      const amountMax   = parseInt(document.getElementById('bcart-amount-max').value) || Infinity;
+      const bankOnly    = document.getElementById('bcart-unpaid-bank-only').checked;
+
+      unpaidSearchBtn.disabled = true;
+      statusDiv.textContent = '💰 未入金を全件検索中…';
+      progressWrap.style.display = 'block';
+      progressBar.style.width = '5%';
+
+      const allRows = [];
+      let page = 1;
+      let totalPages = 1;
+
+      try {
+        // まず1ページ目を取得して総件数を確認
+        const firstRes = await fetch(`${location.origin}/admin/order/list?limit=100&page=1`, { credentials: 'same-origin' });
+        const firstText = await firstRes.text();
+        const firstDoc  = new DOMParser().parseFromString(firstText, 'text/html');
+
+        // 総件数を取得
+        const totalMatch = firstDoc.body.innerHTML.match(/全\s*([\d,]+)\s*件/);
+        const totalCount = totalMatch ? parseInt(totalMatch[1].replace(/,/g,'')) : 0;
+        // 実際に取得できた行数からページ数を推定
+        const firstRows = firstDoc.querySelectorAll('table tbody tr');
+        const rowsPerPage = firstRows.length || 25;
+        totalPages = Math.ceil(totalCount / rowsPerPage);
+
+        // デバッグ：最初の数行のtd[10]を確認
+        if (firstRows[0]) {
+          const tds = firstRows[0].querySelectorAll('td');
+          console.log('[未入金] 1行目のtd数:', tds.length);
+          tds.forEach((td, i) => console.log(`td[${i}]:`, td.textContent.trim().replace(/\s+/g,' ').substring(0,40)));
+        }
+        // 入金日がある行のtd[10]を確認
+        firstRows.forEach((row, ri) => {
+          if (ri > 5) return;
+          const tds = row.querySelectorAll('td');
+          if (tds[10]) console.log(`[未入金] row[${ri}] td[10]:`, JSON.stringify(tds[10].textContent.trim()));
+        });
+
+        statusDiv.textContent = `💰 全${totalCount}件を検索中… (1/${totalPages}ページ)`;
+
+        // 1ページ目のデータを処理
+        firstDoc.querySelectorAll('table tbody tr').forEach(row => {
+          if (matchUnpaidRow(row, amountMin, amountMax, bankOnly)) allRows.push(row.outerHTML);
+        });
+        progressBar.style.width = `${Math.round(1 / totalPages * 100)}%`;
+
+        // 2ページ目以降を取得
+        for (page = 2; page <= totalPages; page++) {
+          statusDiv.textContent = `💰 全${totalCount}件を検索中… (${page}/${totalPages}ページ)`;
+          progressBar.style.width = `${Math.round(page / totalPages * 100)}%`;
+          try {
+            const res = await fetch(`${location.origin}/admin/order/list?limit=100&page=${page}`, { credentials: 'same-origin' });
+            const text = await res.text();
+            const doc  = new DOMParser().parseFromString(text, 'text/html');
+            doc.querySelectorAll('table tbody tr').forEach(row => {
+              if (matchUnpaidRow(row, amountMin, amountMax, bankOnly)) allRows.push(row.outerHTML);
+            });
+          } catch(e) { console.error(`ページ${page}取得エラー:`, e); }
+          await new Promise(r => setTimeout(r, 300));
+        }
+      } catch(e) {
+        console.error('未入金検索エラー:', e);
+        statusDiv.textContent = '⚠️ 検索に失敗しました';
+        unpaidSearchBtn.disabled = false;
+        return;
+      }
+
+      // テーブルに反映
+      const tbody = document.querySelector('table tbody');
+      if (tbody && allRows.length) {
+        tbody.innerHTML = allRows.join('');
+        tbody.querySelectorAll('tr').forEach(r => r.classList.add('bcart-highlight'));
+      } else if (tbody) {
+        tbody.innerHTML = '<tr><td colspan="16" style="text-align:center;padding:20px;color:#64748b;">未入金の受注が見つかりませんでした</td></tr>';
+      }
+
+      progressBar.style.width = '100%';
+      statusDiv.textContent = `✅ 未入金：${allRows.length}件`;
+      filterBanner.style.display = 'block';
+      filterBanner.innerHTML = `<b>💰 未入金絞り込み中</b><br>該当：${allRows.length}件`;
+      resetBtn.style.display = 'block';
+      unpaidSearchBtn.disabled = false;
+      unpaidPicker.style.display = 'none';
+    });
+  }
+
+  // 未入金行の判定
+  function matchUnpaidRow(row, amountMin, amountMax, bankOnly) {
+    const tds = row.querySelectorAll('td');
+    if (tds.length < 13) return false;
+
+    // td[10]=入金日：先頭が「ー」なら未入金、日付(YYYY-MM-DD)なら入金済み
+    const paymentDateText = tds[10] ? tds[10].textContent.trim() : '';
+    const firstChar = paymentDateText.trim().charAt(0);
+    const isUnpaid = firstChar === 'ー' || firstChar === '-' || firstChar === '—';
+    if (!isUnpaid) return false;
+
+    // td[12]=決済方法：銀行振込のみフィルター
+    if (bankOnly) {
+      const payment = tds[12] ? tds[12].textContent.trim() : '';
+      if (!payment.includes('銀行振込')) return false;
+    }
+
+    // td[4]=受注総額：金額範囲フィルター
+    if (amountMin > 0 || amountMax !== Infinity) {
+      const amountText = tds[4] ? tds[4].textContent.replace(/[^\d]/g,'') : '0';
+      const amount = parseInt(amountText) || 0;
+      if (amount < amountMin || amount > amountMax) return false;
+    }
+
+    return true;
+  }
+
+
+
   // ページ読み込み
   async function waitForTable(maxWait = 5000) {
     const start = Date.now();
@@ -1085,6 +1258,10 @@
       printArea.style.display = 'block';
       const dateArea = document.getElementById('bcart-date-area');
       if (dateArea) dateArea.style.display = 'block';
+    }
+    if (location.pathname.includes('/order')) {
+      const unpaidArea = document.getElementById('bcart-unpaid-area');
+      if (unpaidArea) unpaidArea.style.display = 'block';
     }
     const saved = loadState();
     if (saved && saved.orderNumbers && saved.orderNumbers.length) {
@@ -1103,6 +1280,10 @@
         printArea.style.display = 'block';
         const dateArea = document.getElementById('bcart-date-area');
         if (dateArea) dateArea.style.display = 'block';
+      }
+      if (location.pathname.includes('/order')) {
+        const unpaidArea = document.getElementById('bcart-unpaid-area');
+        if (unpaidArea) unpaidArea.style.display = 'block';
       }
       const saved = loadState();
       if (saved && saved.orderNumbers && saved.orderNumbers.length) {
