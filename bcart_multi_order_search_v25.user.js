@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bカート 複数受注番号まとめて検索 v25（発送指示書デザイン統合）
 // @namespace    http://tampermonkey.net/
-// @version      25.54
+// @version      25.69
 // @description  複数受注番号の絞り込み・納品書印刷・ドラッグ移動・ポップアップ時自動非表示
 // @author       You
 // @match        https://*.bcart.jp/admin/order*
@@ -66,9 +66,15 @@
       background: #ffffff; border: 2px solid #3a7bd5; border-radius: 10px;
       box-shadow: 0 4px 24px rgba(58,123,213,0.18);
       font-family: 'Hiragino Kaku Gothic Pro', Meiryo, sans-serif; font-size: 13px; cursor: default;
+      max-height: 90vh; flex-direction: column;
     }
-    #bcart-panel.minimized #bcart-body { display: none; }
+    #bcart-panel.minimized #bcart-body { display: none !important; }
     #bcart-panel.hidden { display: none !important; }
+    #bcart-body {
+      padding: 14px; overflow-y: auto; flex: 1; max-height: calc(90vh - 44px);
+    }
+    #bcart-body::-webkit-scrollbar { width: 6px; }
+    #bcart-body::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 99px; }
     #bcart-header {
       background: linear-gradient(135deg, #3a7bd5, #2563b0); color: white;
       padding: 10px 14px; border-radius: 8px 8px 0 0;
@@ -169,12 +175,16 @@
   const panel = document.createElement('div');
   panel.id = 'bcart-panel';
   panel.classList.add('minimized');
+  // パネルの高さ制限をインラインで設定
+  panel.style.display = 'flex';
+  panel.style.maxHeight = '90vh';
+  panel.style.flexDirection = 'column';
   panel.innerHTML = `
     <div id="bcart-header">
       <span>⠿ 複数受注番号 まとめて検索</span>
       <button id="bcart-min-btn">＋</button>
     </div>
-    <div id="bcart-body">
+    <div id="bcart-body" style="overflow-y:auto;flex:1;padding:14px;">
       <div id="bcart-tabs">
         <div class="bcart-tab active" data-tab="text">手入力</div>
         <div class="bcart-tab" data-tab="csv">CSVアップロード</div>
@@ -273,10 +283,21 @@
           <button id="bcart-credit-search-btn" style="width:100%;background:linear-gradient(135deg,#7c3aed,#5b21b6);color:white;border:none;border-radius:6px;padding:8px 0;font-size:12px;font-weight:bold;cursor:pointer;">🔍 クレジット払いを全件抽出</button>
         </div>
       </div>
+
       <button id="bcart-reset-btn">✕ 絞り込みを解除する</button>
     </div>
   `;
   document.body.appendChild(panel);
+
+  // パネルボディのスクロール設定（インラインで強制適用）
+  setTimeout(() => {
+    const body = document.getElementById('bcart-body');
+    if (body) {
+      body.style.overflowY = 'auto';
+      body.style.maxHeight = 'calc(90vh - 50px)';
+      body.style.flex = '1';
+    }
+  }, 100);
 
   // ドラッグ移動
   (function() {
@@ -317,7 +338,11 @@
   // モーダル検知
   const modalObserver = new MutationObserver(() => {
     const hasModal = document.body.classList.contains('modaal-noscroll') || document.body.classList.contains('modal-open') || !!document.querySelector('.modaal-overlay, .modal-backdrop');
-    panel.classList.toggle('hidden', hasModal);
+    if (hasModal) {
+      panel.style.display = 'none';
+    } else {
+      panel.style.display = 'flex';
+    }
   });
   modalObserver.observe(document.body, { attributes: true, attributeFilter: ['class'], childList: true });
 
@@ -1220,6 +1245,201 @@
   }
 
   // =============================================
+  // キャンセルメモ抽出（出荷一覧）
+  // 各発送IDの詳細ページを取得してメモを確認
+  // =============================================
+  // =============================================
+  // キャンセルメモ抽出 - 別ウィンドウで表示
+  // =============================================
+  const cancelMemoOpenBtn = document.getElementById('bcart-cancel-memo-open-btn');
+
+  if (cancelMemoOpenBtn) {
+    cancelMemoOpenBtn.addEventListener('click', () => {
+      openCancelMemoWindow();
+    });
+  }
+
+  function openCancelMemoWindow() {
+    const html = `<!DOCTYPE html>
+<html lang="ja"><head><meta charset="UTF-8"><title>🚫 キャンセルメモ抽出</title>
+<style>
+  body { font-family: 'Hiragino Kaku Gothic Pro', Meiryo, sans-serif; background: #f8fafc; color: #1e293b; margin: 0; padding: 20px; }
+  h2 { color: #ea580c; margin: 0 0 16px; font-size: 16px; }
+  .card { background: white; border-radius: 10px; box-shadow: 0 2px 12px rgba(0,0,0,0.1); padding: 20px; margin-bottom: 16px; }
+  label { display: flex; align-items: center; gap: 8px; font-size: 13px; color: #475569; margin-bottom: 12px; cursor: pointer; }
+  button { background: linear-gradient(135deg,#ea580c,#c2410c); color: white; border: none; border-radius: 8px; padding: 10px 20px; font-size: 14px; font-weight: bold; cursor: pointer; width: 100%; }
+  button:disabled { opacity: 0.5; cursor: not-allowed; }
+  #progress-wrap { background: #e2e8f0; border-radius: 99px; height: 8px; margin: 12px 0; overflow: hidden; display: none; }
+  #progress-bar { height: 100%; background: linear-gradient(90deg,#ea580c,#f97316); border-radius: 99px; width: 0%; transition: width 0.3s; }
+  #status { font-size: 13px; color: #475569; margin: 8px 0; min-height: 20px; text-align: center; }
+  table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  th { background: #ea580c; color: white; padding: 8px 10px; text-align: left; }
+  td { padding: 8px 10px; border-bottom: 1px solid #e2e8f0; }
+  tr:nth-child(even) td { background: #fff7ed; }
+  tr:hover td { background: #fed7aa; }
+  a { color: #ea580c; text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  .memo { color: #dc2626; font-weight: bold; }
+  #result-area { display: none; }
+  .hint { font-size: 11px; color: #94a3b8; margin-bottom: 8px; line-height: 1.6; }
+</style></head>
+<body>
+<div class="card">
+  <h2>🚫 キャンセルメモ抽出</h2>
+  <div class="hint">期間を指定して発送メモ・送り状番号に「キャンセル」を含む件を抽出します</div>
+  <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;">
+    <label style="font-size:13px;min-width:44px;">開始日</label>
+    <input type="date" id="date-start" style="flex:1;padding:6px 8px;border:1px solid #cbd5e1;border-radius:6px;font-size:13px;">
+  </div>
+  <div style="display:flex;align-items:center;gap:8px;margin-bottom:12px;">
+    <label style="font-size:13px;min-width:44px;">終了日</label>
+    <input type="date" id="date-end" style="flex:1;padding:6px 8px;border:1px solid #cbd5e1;border-radius:6px;font-size:13px;">
+  </div>
+  <label><input type="checkbox" id="unshipped-only" checked> 未発送のみ対象</label>
+  <button id="search-btn" onclick="startSearch()">🔍 キャンセルを全件抽出</button>
+  <div id="progress-wrap"><div id="progress-bar"></div></div>
+  <div id="status">ボタンを押して開始してください</div>
+</div>
+<div id="result-area" class="card">
+  <h2 id="result-title"></h2>
+  <table id="result-table">
+    <thead><tr><th>発送ID</th><th>送り状番号</th><th>発送メモ</th><th>会社名</th><th>発送状況</th></tr></thead>
+    <tbody id="result-body"></tbody>
+  </table>
+</div>
+<script>
+const origin = '${location.origin}';
+// デフォルト日付：直近1ヶ月
+window.addEventListener('load', () => {
+  const today = new Date();
+  const monthAgo = new Date(today);
+  monthAgo.setMonth(today.getMonth() - 1);
+  const fmt = d => d.getFullYear() + '-' + String(d.getMonth()+1).padStart(2,'0') + '-' + String(d.getDate()).padStart(2,'0');
+  document.getElementById('date-start').value = fmt(monthAgo);
+  document.getElementById('date-end').value   = fmt(today);
+});
+
+async function startSearch() {
+  const btn = document.getElementById('search-btn');
+  const unshippedOnly = document.getElementById('unshipped-only').checked;
+  btn.disabled = true;
+  document.getElementById('progress-wrap').style.display = 'block';
+  document.getElementById('result-area').style.display = 'none';
+  document.getElementById('result-body').innerHTML = '';
+
+  const setStatus = (msg) => document.getElementById('status').textContent = msg;
+  const setProgress = (pct) => document.getElementById('progress-bar').style.width = pct + '%';
+
+  // 全発送IDを収集
+  setStatus('📋 出荷一覧を取得中...');
+  const allIds = [];
+  try {
+    const dateStart = document.getElementById('date-start').value;
+    const dateEnd   = document.getElementById('date-end').value;
+    if (!dateStart || !dateEnd) { setStatus('⚠️ 開始日と終了日を入力してください'); btn.disabled = false; return; }
+    const dateParam = '&order_time[start]=' + dateStart + '&order_time[end]=' + dateEnd;
+    const firstRes = await fetch(origin + '/admin/logistics/list?limit=100&page=1' + dateParam, { credentials: 'same-origin' });
+    const firstText = await firstRes.text();
+    const firstDoc = new DOMParser().parseFromString(firstText, 'text/html');
+    const totalStr = firstDoc.body.innerHTML; const totalMatch = totalStr.indexOf("件中") > -1 ? totalStr.substring(0, totalStr.indexOf("件中")).trim().match(/([0-9, ]+)$/) : null;
+    const totalCount = totalMatch ? parseInt(totalMatch[1].replace(/[, ]/g,'')) : 0;
+    const firstRows = firstDoc.querySelectorAll('table tbody tr');
+    const rowsPerPage = firstRows.length || 25;
+    const totalPages = Math.ceil(totalCount / rowsPerPage);
+
+    const extractIds = (doc) => {
+      doc.querySelectorAll('table tbody tr').forEach(row => {
+        if (unshippedOnly && row.innerHTML.includes('change_logistics_status_disabled')) return;
+        const cb = row.querySelector('input[name="id_check[]"]');
+        if (cb && cb.value) allIds.push(cb.value);
+      });
+    };
+    extractIds(firstDoc);
+
+    for (let page = 2; page <= totalPages; page++) {
+      setStatus('📋 出荷一覧取得中... (' + page + '/' + totalPages + 'ページ)');
+      setProgress(Math.round(page/totalPages*30));
+      const res = await fetch(origin + '/admin/logistics/list?limit=100&page=' + page + dateParam, { credentials: 'same-origin' });
+      const text = await res.text();
+      extractIds(new DOMParser().parseFromString(text, 'text/html'));
+      await new Promise(r => setTimeout(r, 200));
+    }
+  } catch(e) {
+    setStatus('⚠️ 出荷一覧の取得に失敗しました');
+    btn.disabled = false;
+    return;
+  }
+
+  // 各発送IDの詳細を確認
+  const results = [];
+  for (let i = 0; i < allIds.length; i++) {
+    const id = allIds[i];
+    setStatus('🔍 詳細確認中... ' + (i+1) + '/' + allIds.length + '件 (ID:' + id + ')');
+    setProgress(30 + Math.round((i+1)/allIds.length*70));
+    try {
+      const res = await fetch(origin + '/admin/logistics/' + id + '/view', { credentials: 'same-origin' });
+      const text = await res.text();
+      const doc = new DOMParser().parseFromString(text, 'text/html');
+
+      let shipMemo = '', shipCode = '', companyName = '', status = '';
+
+      // th=ラベル、td=値 の構造で取得
+      doc.querySelectorAll('tr').forEach(row => {
+        const th = row.querySelector('th');
+        const td = row.querySelector('td');
+        if (!th || !td) return;
+        const label = th.textContent.trim();
+        const val   = td.textContent.trim();
+        if (label.includes('送り状番号')) shipCode    = val;
+        if (label.includes('発送メモ'))   shipMemo    = val;
+        if (label.includes('会社名'))     companyName = companyName || val;
+      });
+
+      // 発送状況はtd[11]固定
+      const allTds = doc.querySelectorAll('td');
+      if (allTds[11]) status = allTds[11].textContent.trim();
+      if (!companyName && allTds[14]) companyName = allTds[14].textContent.trim();
+
+      // キャンセルチェック
+      const hasCancelMemo = shipMemo.includes('キャンセル') || shipCode.includes('キャンセル');
+      if (hasCancelMemo) {
+        results.push({ id, shipMemo, shipCode, companyName, status });
+      }
+    } catch(e) {}
+    await new Promise(r => setTimeout(r, 250));
+  }
+
+  setProgress(100);
+
+  if (!results.length) {
+    setStatus('✅ キャンセルメモの発送IDは見つかりませんでした（' + allIds.length + '件確認）');
+    btn.disabled = false;
+    return;
+  }
+
+  // 結果を表示
+  document.getElementById('result-title').textContent = '🚫 キャンセルメモ該当：' + results.length + '件';
+  const tbody = document.getElementById('result-body');
+  tbody.innerHTML = results.map(r => \`<tr>
+    <td><a href="\${origin}/admin/logistics/\${r.id}/view" target="_blank">\${r.id}</a></td>
+    <td class="memo">\${r.shipCode || '－'}</td>
+    <td class="memo">\${r.shipMemo || '－'}</td>
+    <td>\${r.companyName || '－'}</td>
+    <td>\${r.status || '－'}</td>
+  </tr>\`).join('');
+  document.getElementById('result-area').style.display = 'block';
+  setStatus('✅ 完了：' + results.length + '件見つかりました');
+  btn.disabled = false;
+}
+</script>
+</body></html>`;
+
+    const blob = new Blob([html], { type: 'text/html;charset=utf-8' });
+    const url  = URL.createObjectURL(blob);
+    window.open(url, '_blank', 'width=900,height=700,scrollbars=yes');
+  }
+
+  // =============================================
   // 受注一覧 全件スキャン共通処理
   // =============================================
   async function runOrderSearch({ label, matchFn }) {
@@ -1233,8 +1453,8 @@
       const firstText = await firstRes.text();
       const firstDoc  = new DOMParser().parseFromString(firstText, 'text/html');
 
-      const totalMatch = firstDoc.body.innerHTML.match(/全\s*([\d,]+)\s*件/);
-      const totalCount = totalMatch ? parseInt(totalMatch[1].replace(/,/g,'')) : 0;
+      const totalStr = firstDoc.body.innerHTML; const totalMatch = totalStr.indexOf("件中") > -1 ? totalStr.substring(0, totalStr.indexOf("件中")).trim().match(/([0-9, ]+)$/) : null;
+      const totalCount = totalMatch ? parseInt(totalMatch[1].replace(/[, ]/g,'')) : 0;
       const firstRows  = firstDoc.querySelectorAll('table tbody tr');
       const rowsPerPage = firstRows.length || 25;
       const totalPages  = Math.ceil(totalCount / rowsPerPage);
@@ -1324,9 +1544,30 @@
     while (Date.now() - start < maxWait) { if (document.querySelector('table tbody tr')) return true; await new Promise(r => setTimeout(r, 200)); }
     return false;
   }
+  // 出荷一覧に独立したキャンセルメモボタンを追加
+  function addCancelMemoButton() {
+    if (!location.pathname.includes('logistics')) return;
+    if (document.getElementById('bcart-cancel-floating-btn')) return;
+
+    const btn = document.createElement('button');
+    btn.id = 'bcart-cancel-floating-btn';
+    btn.textContent = '🚫 キャンセルメモを抽出';
+    btn.style.cssText = [
+      'position:fixed', 'bottom:80px', 'right:20px', 'z-index:99998',
+      'background:linear-gradient(135deg,#ea580c,#c2410c)', 'color:white',
+      'border:none', 'border-radius:8px', 'padding:10px 16px',
+      'font-size:13px', 'font-weight:bold', 'cursor:pointer',
+      'box-shadow:0 4px 12px rgba(234,88,12,0.4)',
+      'font-family:Hiragino Kaku Gothic Pro,Meiryo,sans-serif'
+    ].join(';');
+    btn.addEventListener('click', openCancelMemoWindow);
+    document.body.appendChild(btn);
+  }
+
   async function onPageReady() {
     if (location.pathname.includes('logistics')) {
       printArea.style.display = 'block';
+      addCancelMemoButton();
       const dateArea = document.getElementById('bcart-date-area');
       if (dateArea) dateArea.style.display = 'block';
     }
@@ -1337,6 +1578,7 @@
       if (paymentDateArea) paymentDateArea.style.display = 'block';
       const creditArea = document.getElementById('bcart-credit-area');
       if (creditArea) creditArea.style.display = 'block';
+
     }
     const saved = loadState();
     if (saved && saved.orderNumbers && saved.orderNumbers.length) {
@@ -1353,6 +1595,7 @@
     setTimeout(async () => {
       if (location.pathname.includes('logistics')) {
         printArea.style.display = 'block';
+        addCancelMemoButton();
         const dateArea = document.getElementById('bcart-date-area');
         if (dateArea) dateArea.style.display = 'block';
       }
