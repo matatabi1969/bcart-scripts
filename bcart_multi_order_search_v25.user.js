@@ -751,9 +751,8 @@
     });
     const productsWithImages = await Promise.all(
       productPromises.map(async p => {
-        const imgUrl = p.productId ? await fetchProductImage(p.productId) : '';
-        const imgSrc = imgUrl ? await fetchImageAsBase64(imgUrl) : '';
-        return { name: p.productName, setName: p.setName || '', quantity: p.quantity, imgSrc, productId: p.productId };
+       const imgUrl = p.productId ? await fetchProductImage(p.productId) : '';
+return { name: p.productName, setName: p.setName || '', quantity: p.quantity, imgSrc: imgUrl, productId: p.productId };
       })
     );
     products.push(...productsWithImages.filter(p => p.name && p.name.length > 0));
