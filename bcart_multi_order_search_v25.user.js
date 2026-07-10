@@ -757,10 +757,19 @@ return { name: p.productName, setName: p.setName || '', quantity: p.quantity, im
     );
     products.push(...productsWithImages.filter(p => p.name && p.name.length > 0));
 
+    // 発送メモ取得
+    let shipMemo = '';
+    doc.querySelectorAll('tr').forEach(row => {
+      const th = row.querySelector('th');
+      const td = row.querySelector('td');
+      if (!th || !td) return;
+      if (th.textContent.trim().includes('発送メモ')) shipMemo = td.textContent.trim();
+    });
+
     const hasColdProduct = products.some(p => p.productId && COLD_PRODUCT_IDS.has(p.productId));
     const hasCoolPrepaid = products.some(p => p.productId && COOL_PREPAID_IDS.has(p.productId));
     const finalDeliveryGroup = hasColdProduct ? '輸入代行費グループA' : hasCoolPrepaid ? 'ヤマトクール元払い' : '';
-    return { logisticsId, orderCode: orderCodeFromPage, companyName: companyName || '（会社名取得中）', deliveryGroup: finalDeliveryGroup, personName, tel, zip, address1, address2, address3: address3||'', products };
+    return { logisticsId, orderCode: orderCodeFromPage, companyName: companyName || '（会社名取得中）', deliveryGroup: finalDeliveryGroup, personName, tel, zip, address1, address2, address3: address3||'', shipMemo, products };
   }
 
   // 発送指示書HTML生成
@@ -794,26 +803,24 @@ return { name: p.productName, setName: p.setName || '', quantity: p.quantity, im
     const coldOrders   = flatOrders.filter(o => (o.deliveryGroup||'').includes('輸入代行費グループA'));
     const coolOrders   = flatOrders.filter(o => (o.deliveryGroup||'').includes('ヤマトクール元払い'));
     const normalOrders = flatOrders.filter(o => !(o.deliveryGroup||'').includes('輸入代行費グループA') && !(o.deliveryGroup||'').includes('ヤマトクール元払い'));
-    function layoutOrders(orderList) {
-      const MAX_PRODUCTS = 3;
+　　function layoutOrders(orderList) {
+      const MAX_ORDERS = 3;
       const result = [];
-      let buf = [], bufTotal = 0;
-      const flush = () => { if (buf.length > 0) { result.push({ orders: buf }); buf = []; bufTotal = 0; } };
+      let buf = [];
+      const flush = () => { if (buf.length > 0) { result.push({ orders: buf }); buf = []; } };
       orderList.forEach(order => {
-        const n = (order.products || []).length;
         const isSplit = (order.totalChunks || 1) > 1;
-        if (n >= 3 || isSplit) {
+        if (isSplit) {
           flush();
           result.push({ orders: [order] });
         } else {
-          if (bufTotal + n > MAX_PRODUCTS) flush();
+          if (buf.length >= MAX_ORDERS) flush();
           buf.push(order);
-          bufTotal += n;
         }
       });
       flush();
       return result;
-    }
+        }
     const pages = [...layoutOrders(normalOrders), ...layoutOrders(coolOrders), ...layoutOrders(coldOrders)];
     const totalPages = pages.length;
     const today = new Date();
@@ -867,6 +874,7 @@ return { name: p.productName, setName: p.setName || '', quantity: p.quantity, im
             <div class="id-row"><span class="id-label">受注番号</span><span class="id-value">${order.orderCode||''}</span></div>
           </div>
           <div class="company-block"><div class="company-name">${order.companyName||'（会社名不明）'}</div></div>
+          ${order.shipMemo ? `<div class="ship-memo-badge">📝 ${order.shipMemo}</div>` : ''}
           ${coldLabel}
           ${staffCheck}
         </div>`;
@@ -954,6 +962,7 @@ return { name: p.productName, setName: p.setName || '', quantity: p.quantity, im
   .continued-note{background:#fef3c7;color:#92400e;border:1px solid #fde68a;border-radius:6px;padding:5px 8px;font-size:11px;font-weight:700;text-align:center;}
   .page-footer{background:#f1f5f9;border-top:1px solid var(--border);padding:5px 20px;display:flex;justify-content:space-between;font-size:11px;color:var(--text-muted);}
   .page-num{font-weight:700;color:var(--primary);font-size:12px;}
+  .ship-memo-badge{display:block;background:#fefce8;color:#92400e;border:1.5px solid #fde68a;border-radius:5px;padding:4px 8px;font-size:11px;font-weight:700;}
 </style></head><body>${pagesHTML}</body></html>`;
   }
 
@@ -1571,6 +1580,7 @@ async function startSearch() {
       if (dateArea) dateArea.style.display = 'block';
     }
     if (location.pathname.includes('/order')) {
+      addMedixorBtn(); // ← 追加
       const unpaidArea = document.getElementById('bcart-unpaid-area');
       if (unpaidArea) unpaidArea.style.display = 'block';
       const paymentDateArea = document.getElementById('bcart-payment-date-area');
@@ -1611,3 +1621,83 @@ async function startSearch() {
   });
 
 })();
+
+// =============================================
+  // medixor会員 一括設定
+  // =============================================
+  function addMedixorBtn() {
+    if (!location.pathname.includes('/order')) return;
+    if (document.getElementById('bcart-medixor-btn')) return;
+    const btn = document.createElement('button');
+    btn.id = 'bcart-medixor-btn';
+    btn.textContent = '🏥 medixor会員に設定';
+    btn.style.cssText = [
+      'position:fixed','bottom:20px','right:20px','z-index:99998',
+      'background:linear-gradient(135deg,#0891b2,#0e7490)','color:white',
+      'border:none','border-radius:8px','padding:10px 16px',
+      'font-size:13px','font-weight:bold','cursor:pointer',
+      'box-shadow:0 4px 12px rgba(8,145,178,0.4)',
+      'font-family:Hiragino Kaku Gothic Pro,Meiryo,sans-serif'
+    ].join(';');
+    btn.addEventListener('click', runMedixorBulk);
+    document.body.appendChild(btn);
+  }
+
+  async function runMedixorBulk() {
+    // チェックされた受注IDを取得
+    const orderIds = [];
+    document.querySelectorAll('table tbody tr').forEach(row => {
+      const cb = row.querySelector('input[type="checkbox"]');
+      if (!cb || !cb.checked) return;
+      const a = row.querySelector('a[href*="/admin/order/"]');
+      if (!a) return;
+      const m = a.href.match(/\/admin\/order\/(\d+)\//);
+      if (m) orderIds.push(m[1]);
+    });
+    if (!orderIds.length) { alert('受注をチェックしてください'); return; }
+    if (!confirm(`${orderIds.length}件をmedixor会員に設定しますか？`)) return;
+
+    const btn = document.getElementById('bcart-medixor-btn');
+    btn.disabled = true;
+    let success = 0;
+    for (let i = 0; i < orderIds.length; i++) {
+      const id = orderIds[i];
+      btn.textContent = `🏥 処理中… (${i+1}/${orderIds.length})`;
+      try {
+        // 編集ページを取得してフォーム全体を取得
+        const res = await fetch(`${location.origin}/admin/order/${id}/edit`, { credentials: 'same-origin' });
+        const text = await res.text();
+        const doc = new DOMParser().parseFromString(text, 'text/html');
+        const form = doc.querySelector('form');
+        if (!form) continue;
+        const fd = new FormData();
+        // 既存フォーム値をコピー
+        doc.querySelectorAll('input[name], select[name], textarea[name]').forEach(el => {
+          if (!el.name || el.name === '_token') return;
+          if (el.type === 'checkbox' || el.type === 'radio') {
+            if (el.checked) fd.append(el.name, el.value);
+          } else {
+            fd.append(el.name, el.value || '');
+          }
+        });
+        // CSRFトークン
+        const token = doc.querySelector('input[name="_token"]')?.value || getCsrfToken();
+        fd.append('_token', token);
+        // medixor会員チェックを追加
+        fd.append('customer_custom[37][]', '会員');
+        // POST送信
+        const postRes = await fetch(`${location.origin}/admin/order/${id}/edit`, {
+          method: 'POST',
+          credentials: 'same-origin',
+          body: fd,
+        });
+        if (postRes.ok) success++;
+      } catch(e) {
+        console.error('エラー:', id, e);
+      }
+      await new Promise(r => setTimeout(r, 500));
+    }
+    btn.textContent = '🏥 medixor会員に設定';
+    btn.disabled = false;
+    alert(`✅ ${success}/${orderIds.length}件 完了しました`);
+  }
