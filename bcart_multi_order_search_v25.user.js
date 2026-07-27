@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bカート 複数受注番号まとめて検索 v25（発送指示書デザイン統合）
 // @namespace    http://tampermonkey.net/
-// @version      25.69
+// @version      25.78
 // @description  複数受注番号の絞り込み・納品書印刷・ドラッグ移動・ポップアップ時自動非表示
 // @author       You
 // @match        https://*.bcart.jp/admin/order*
@@ -145,6 +145,28 @@
       font-size: 12px; font-weight: bold; cursor: pointer; display: none;
     }
     .bcart-filtered-out { display: none !important; }
+    #bcart-unpaid-warning {
+      position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+      background: rgba(0,0,0,0.5); z-index: 999999;
+      display: none; align-items: center; justify-content: center;
+    }
+    #bcart-unpaid-warning.show { display: flex; }
+    #bcart-unpaid-warning-box {
+      background: white; border-radius: 12px; padding: 24px; max-width: 480px; width: 90%;
+      box-shadow: 0 8px 32px rgba(0,0,0,0.2);
+      font-family: 'Hiragino Kaku Gothic Pro', Meiryo, sans-serif;
+    }
+    #bcart-unpaid-warning-box h3 { color: #dc2626; font-size: 15px; margin: 0 0 12px; }
+    #bcart-unpaid-warning-box .warn-list {
+      background: #fef2f2; border: 1px solid #fca5a5; border-radius: 8px;
+      padding: 10px 14px; margin: 0 0 16px; max-height: 200px; overflow-y: auto;
+      font-size: 12px; line-height: 1.8;
+    }
+    #bcart-unpaid-warning-box .warn-item { color: #dc2626; }
+    #bcart-unpaid-warning-box .warn-item span { color: #475569; margin-left: 8px; }
+    .bcart-warn-btns { display: flex; gap: 8px; }
+    #bcart-warn-continue { flex: 1; background: linear-gradient(135deg,#dc2626,#b91c1c); color: white; border: none; border-radius: 8px; padding: 10px; font-size: 13px; font-weight: bold; cursor: pointer; }
+    #bcart-warn-cancel { flex: 1; background: #f1f5f9; color: #475569; border: 1px solid #cbd5e1; border-radius: 8px; padding: 10px; font-size: 13px; font-weight: bold; cursor: pointer; }
     .bcart-highlight td { background: #eff6ff !important; }
     .bcart-date-area { margin-top: 10px; }
     .bcart-date-area .print-title { font-size: 11px; color: #475569; font-weight: bold; margin-bottom: 6px; text-align: center; }
@@ -289,6 +311,30 @@
   `;
   document.body.appendChild(panel);
 
+  // 未入金警告モーダル
+  const warnModal = document.createElement('div');
+  warnModal.id = 'bcart-unpaid-warning';
+  warnModal.innerHTML = `
+    <div id="bcart-unpaid-warning-box">
+      <h3>⚠️ 未入金の受注が含まれています</h3>
+      <div class="warn-list" id="bcart-warn-list"></div>
+      <div class="bcart-warn-btns">
+        <button id="bcart-warn-cancel">キャンセル</button>
+        <button id="bcart-warn-continue">続けて印刷する</button>
+      </div>
+    </div>
+  `;
+  document.body.appendChild(warnModal);
+  document.getElementById('bcart-warn-cancel').addEventListener('click', () => {
+    warnModal.classList.remove('show');
+    warnPendingResolve && warnPendingResolve(false);
+  });
+  document.getElementById('bcart-warn-continue').addEventListener('click', () => {
+    warnModal.classList.remove('show');
+    warnPendingResolve && warnPendingResolve(true);
+  });
+  let warnPendingResolve = null;
+
   // パネルボディのスクロール設定（インラインで強制適用）
   setTimeout(() => {
     const body = document.getElementById('bcart-body');
@@ -345,6 +391,152 @@
     }
   });
   modalObserver.observe(document.body, { attributes: true, attributeFilter: ['class'], childList: true });
+
+  // =============================================
+  // 納品書作成iframeの出現を監視して未入金チェック
+  // iframe URL: /admin/invoice/invoice?oId={受注ID}&is_modal=1
+  //             /admin/invoice/logistics?logistics_id={発送ID}&is_modal=1
+  // =============================================
+  let lastCheckedIframeSrc = '';
+
+  // モーダルが閉じたらlastCheckedIframeSrcをリセット
+  const resetObserver = new MutationObserver(() => {
+    const hasInvoiceIframe = !!document.querySelector('iframe[src*="/admin/invoice/"]');
+    if (!hasInvoiceIframe) lastCheckedIframeSrc = '';
+  });
+  resetObserver.observe(document.body, { childList: true, subtree: true });
+  const invoiceIframeObserver = new MutationObserver(async () => {
+    const iframes = document.querySelectorAll('iframe[src*="/admin/invoice/"]');
+    for (const iframe of iframes) {
+      const src = iframe.getAttribute('src') || '';
+      console.log('[未入金チェック] iframe発見:', src);
+      // 処理中フラグで重複実行を防ぐ
+      if (iframe._checking) continue;
+      iframe._checking = true;
+      setTimeout(() => { iframe._checking = false; }, 5000);
+
+      // 受注ID or 発送IDを取得
+      const oIdMatch  = src.match(/[?&]oId=(\d+)/);
+      const lidMatch  = src.match(/[?&]id=(\d+)/);
+
+      let orderCode = '', companyName = '', isUnpaid = false;
+
+      if (oIdMatch) {
+        // 受注IDから受注番号を取得してチェック
+        const orderId = oIdMatch[1];
+        try {
+          const res  = await fetch(`${location.origin}/admin/order/${orderId}/view`, { credentials: 'same-origin' });
+          const text = await res.text();
+          const doc  = new DOMParser().parseFromString(text, 'text/html');
+          // 受注番号：11桁以上の数字をtdから取得
+          doc.querySelectorAll('td').forEach(td => {
+            const txt = td.textContent.trim();
+            if (/^\d{11,}$/.test(txt) && !orderCode) orderCode = txt;
+          });
+          console.log('[未入金チェック] 受注番号:', orderCode);
+          // 会社名取得
+          doc.querySelectorAll('tr').forEach(row => {
+            const th = row.querySelector('th');
+            const td = row.querySelector('td');
+            if (th && td && (th.textContent.includes('会社名') || th.textContent.includes('会員名'))) {
+              companyName = companyName || td.textContent.trim();
+            }
+          });
+          // 受注番号で受注一覧を検索して入金日確認
+          if (orderCode) {
+            const sRes  = await fetch(`${location.origin}/admin/order/list?order_code=${encodeURIComponent(orderCode)}`, { credentials: 'same-origin' });
+            const sText = await sRes.text();
+            const sDoc  = new DOMParser().parseFromString(sText, 'text/html');
+            sDoc.querySelectorAll('table tbody tr').forEach(row => {
+              const tds = row.querySelectorAll('td');
+              if (tds.length < 11) return;
+              if (tds[3] && tds[3].textContent.includes(orderCode)) {
+                const firstChar = tds[10] ? tds[10].textContent.trim().charAt(0) : '';
+                if (firstChar === 'ー' || firstChar === '-' || firstChar === '—') isUnpaid = true;
+              }
+            });
+          }
+        } catch(e) { console.error('未入金チェックエラー:', e); }
+
+      } else if (lidMatch) {
+        // 発送IDから受注番号を取得してチェック
+        const logisticsId = lidMatch[1];
+        try {
+          const res  = await fetch(`${location.origin}/admin/logistics/${logisticsId}/view`, { credentials: 'same-origin' });
+          const text = await res.text();
+          const doc  = new DOMParser().parseFromString(text, 'text/html');
+          doc.querySelectorAll('a[href*="/admin/order/"]').forEach(a => {
+            const txt = a.textContent.trim();
+            if (/^\d{11,}$/.test(txt) && !orderCode) orderCode = txt;
+          });
+          companyName = doc.querySelectorAll('td')[14]?.textContent.trim() || '';
+          if (orderCode) {
+            const sRes  = await fetch(`${location.origin}/admin/order/list?order_code=${encodeURIComponent(orderCode)}`, { credentials: 'same-origin' });
+            const sText = await sRes.text();
+            const sDoc  = new DOMParser().parseFromString(sText, 'text/html');
+            sDoc.querySelectorAll('table tbody tr').forEach(row => {
+              const tds = row.querySelectorAll('td');
+              if (tds.length < 11) return;
+              if (tds[3] && tds[3].textContent.includes(orderCode)) {
+                const firstChar = tds[10] ? tds[10].textContent.trim().charAt(0) : '';
+                if (firstChar === 'ー' || firstChar === '-' || firstChar === '—') isUnpaid = true;
+              }
+            });
+          }
+        } catch(e) { console.error('未入金チェックエラー:', e); }
+      }
+
+      // 未入金の場合は警告バナーをモーダルの上に表示
+      if (isUnpaid) {
+        // 既存の警告があれば削除
+        const existingWarn = document.getElementById('bcart-iframe-warn');
+        if (existingWarn) existingWarn.remove();
+
+        const warn = document.createElement('div');
+        warn.id = 'bcart-iframe-warn';
+        warn.style.cssText = [
+          'position:fixed', 'top:50%', 'left:50%',
+          'transform:translate(-50%,-50%)',
+          'z-index:9999999',
+          'background:white', 'border-radius:12px',
+          'box-shadow:0 8px 32px rgba(0,0,0,0.3)',
+          'padding:24px', 'max-width:420px', 'width:90%',
+          'font-family:Hiragino Kaku Gothic Pro,Meiryo,sans-serif',
+          'border:3px solid #dc2626'
+        ].join(';');
+        warn.innerHTML = `
+          <div style="color:#dc2626;font-size:16px;font-weight:bold;margin-bottom:12px;">⚠️ 未入金の受注です</div>
+          <div style="font-size:13px;color:#475569;margin-bottom:8px;">
+            <b>受注番号：</b>${orderCode || '不明'}<br>
+            <b>会社名：</b>${companyName || '不明'}
+          </div>
+          <div style="font-size:12px;color:#94a3b8;margin-bottom:16px;">入金が確認されていません。印刷しますか？</div>
+          <div style="display:flex;gap:8px;">
+            <button id="bcart-iframe-warn-cancel" style="flex:1;background:#f1f5f9;color:#475569;border:1px solid #cbd5e1;border-radius:8px;padding:10px;font-size:13px;font-weight:bold;cursor:pointer;">キャンセル</button>
+            <button id="bcart-iframe-warn-ok" style="flex:1;background:linear-gradient(135deg,#dc2626,#b91c1c);color:white;border:none;border-radius:8px;padding:10px;font-size:13px;font-weight:bold;cursor:pointer;">続けて印刷</button>
+          </div>
+        `;
+        document.body.appendChild(warn);
+
+        // 背景オーバーレイ
+        const overlay = document.createElement('div');
+        overlay.id = 'bcart-iframe-warn-overlay';
+        overlay.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.5);z-index:9999998;';
+        document.body.appendChild(overlay);
+
+        document.getElementById('bcart-iframe-warn-cancel').addEventListener('click', () => {
+          warn.remove(); overlay.remove();
+          // モーダルを閉じる
+          const closeBtn = document.querySelector('.modaal-close, .modal-close, [class*="close"]');
+          if (closeBtn) closeBtn.click();
+        });
+        document.getElementById('bcart-iframe-warn-ok').addEventListener('click', () => {
+          warn.remove(); overlay.remove();
+        });
+      }
+    }
+  });
+  invoiceIframeObserver.observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['src'] });
 
   // タブ切り替え
   document.querySelectorAll('.bcart-tab').forEach(tab => {
@@ -468,6 +660,75 @@
     try { w.print(); } catch(e) {}
     await new Promise(r => setTimeout(r, 1000));
     URL.revokeObjectURL(url);
+  }
+
+  // =============================================
+  // 未入金チェック（印刷前に警告表示）
+  // 出荷一覧：発送IDから受注詳細を取得して入金日を確認
+  // 受注一覧：テーブルのtd[10]を直接確認
+  // =============================================
+  async function checkUnpaidAndWarn(ids, isLogistics = true) {
+    statusDiv.textContent = '💰 未入金チェック中…';
+    const unpaidItems = [];
+
+    for (let i = 0; i < ids.length; i++) {
+      const id = ids[i];
+      try {
+        let orderCode = '', companyName = '';
+
+        if (isLogistics) {
+          // 発送IDから受注番号・会社名を取得
+          const res  = await fetch(`${location.origin}/admin/logistics/${id}/view`, { credentials: 'same-origin' });
+          const text = await res.text();
+          const doc  = new DOMParser().parseFromString(text, 'text/html');
+          doc.querySelectorAll('a[href*="/admin/order/"]').forEach(a => {
+            const txt = a.textContent.trim();
+            if (/^\d{11,}$/.test(txt) && !orderCode) orderCode = txt;
+          });
+          companyName = doc.querySelectorAll('td')[14]?.textContent.trim() || '';
+        } else {
+          // 受注一覧のテーブルから受注番号・会社名を直接取得
+          const row = document.querySelector(`table tbody tr:has(input[name="id_check[]"][value="${id}"])`);
+          if (row) {
+            const tds = row.querySelectorAll('td');
+            orderCode   = tds[3] ? tds[3].textContent.trim().split(/\s/)[0] : id;
+            companyName = tds[2] ? tds[2].textContent.trim().split('\n')[0].trim() : '';
+          }
+        }
+
+        // 受注番号で受注一覧を検索して入金日(td[10])を確認
+        if (orderCode) {
+          const searchRes  = await fetch(`${location.origin}/admin/order/list?order_code=${encodeURIComponent(orderCode)}`, { credentials: 'same-origin' });
+          const searchText = await searchRes.text();
+          const searchDoc  = new DOMParser().parseFromString(searchText, 'text/html');
+          let isUnpaid = false;
+          searchDoc.querySelectorAll('table tbody tr').forEach(row => {
+            const tds = row.querySelectorAll('td');
+            if (tds.length < 11) return;
+            if (tds[3] && tds[3].textContent.includes(orderCode)) {
+              const firstChar = tds[10] ? tds[10].textContent.trim().charAt(0) : '';
+              if (firstChar === 'ー' || firstChar === '-' || firstChar === '—') {
+                isUnpaid = true;
+              }
+            }
+          });
+          if (isUnpaid) unpaidItems.push({ id, orderCode, companyName });
+        }
+      } catch(e) { console.error('未入金チェックエラー:', id, e); }
+      await new Promise(r => setTimeout(r, 300));
+    }
+
+    if (!unpaidItems.length) return true; // 未入金なし→そのまま印刷
+
+    // 警告モーダルを表示
+    const list = document.getElementById('bcart-warn-list');
+    list.innerHTML = unpaidItems.map(item =>
+      `<div class="warn-item">⚠️ 発送ID: ${item.id}<span>${item.companyName} / 受注番号: ${item.orderCode}</span></div>`
+    ).join('');
+    document.getElementById('bcart-unpaid-warning').classList.add('show');
+
+    // ユーザーの選択を待つ
+    return new Promise(resolve => { warnPendingResolve = resolve; });
   }
 
   // 発送ID取得
@@ -751,25 +1012,17 @@
     });
     const productsWithImages = await Promise.all(
       productPromises.map(async p => {
-       const imgUrl = p.productId ? await fetchProductImage(p.productId) : '';
-return { name: p.productName, setName: p.setName || '', quantity: p.quantity, imgSrc: imgUrl, productId: p.productId };
+        const imgUrl = p.productId ? await fetchProductImage(p.productId) : '';
+        const imgSrc = imgUrl ? await fetchImageAsBase64(imgUrl) : '';
+        return { name: p.productName, setName: p.setName || '', quantity: p.quantity, imgSrc, productId: p.productId };
       })
     );
     products.push(...productsWithImages.filter(p => p.name && p.name.length > 0));
 
-    // 発送メモ取得
-    let shipMemo = '';
-    doc.querySelectorAll('tr').forEach(row => {
-      const th = row.querySelector('th');
-      const td = row.querySelector('td');
-      if (!th || !td) return;
-      if (th.textContent.trim().includes('発送メモ')) shipMemo = td.textContent.trim();
-    });
-
     const hasColdProduct = products.some(p => p.productId && COLD_PRODUCT_IDS.has(p.productId));
     const hasCoolPrepaid = products.some(p => p.productId && COOL_PREPAID_IDS.has(p.productId));
     const finalDeliveryGroup = hasColdProduct ? '輸入代行費グループA' : hasCoolPrepaid ? 'ヤマトクール元払い' : '';
-    return { logisticsId, orderCode: orderCodeFromPage, companyName: companyName || '（会社名取得中）', deliveryGroup: finalDeliveryGroup, personName, tel, zip, address1, address2, address3: address3||'', shipMemo, products };
+    return { logisticsId, orderCode: orderCodeFromPage, companyName: companyName || '（会社名取得中）', deliveryGroup: finalDeliveryGroup, personName, tel, zip, address1, address2, address3: address3||'', products };
   }
 
   // 発送指示書HTML生成
@@ -803,24 +1056,26 @@ return { name: p.productName, setName: p.setName || '', quantity: p.quantity, im
     const coldOrders   = flatOrders.filter(o => (o.deliveryGroup||'').includes('輸入代行費グループA'));
     const coolOrders   = flatOrders.filter(o => (o.deliveryGroup||'').includes('ヤマトクール元払い'));
     const normalOrders = flatOrders.filter(o => !(o.deliveryGroup||'').includes('輸入代行費グループA') && !(o.deliveryGroup||'').includes('ヤマトクール元払い'));
-　　function layoutOrders(orderList) {
-      const MAX_ORDERS = 3;
+    function layoutOrders(orderList) {
+      const MAX_PRODUCTS = 3;
       const result = [];
-      let buf = [];
-      const flush = () => { if (buf.length > 0) { result.push({ orders: buf }); buf = []; } };
+      let buf = [], bufTotal = 0;
+      const flush = () => { if (buf.length > 0) { result.push({ orders: buf }); buf = []; bufTotal = 0; } };
       orderList.forEach(order => {
+        const n = (order.products || []).length;
         const isSplit = (order.totalChunks || 1) > 1;
-        if (isSplit) {
+        if (n >= 3 || isSplit) {
           flush();
           result.push({ orders: [order] });
         } else {
-          if (buf.length >= MAX_ORDERS) flush();
+          if (bufTotal + n > MAX_PRODUCTS) flush();
           buf.push(order);
+          bufTotal += n;
         }
       });
       flush();
       return result;
-        }
+    }
     const pages = [...layoutOrders(normalOrders), ...layoutOrders(coolOrders), ...layoutOrders(coldOrders)];
     const totalPages = pages.length;
     const today = new Date();
@@ -874,7 +1129,6 @@ return { name: p.productName, setName: p.setName || '', quantity: p.quantity, im
             <div class="id-row"><span class="id-label">受注番号</span><span class="id-value">${order.orderCode||''}</span></div>
           </div>
           <div class="company-block"><div class="company-name">${order.companyName||'（会社名不明）'}</div></div>
-          ${order.shipMemo ? `<div class="ship-memo-badge">📝 ${order.shipMemo}</div>` : ''}
           ${coldLabel}
           ${staffCheck}
         </div>`;
@@ -962,7 +1216,6 @@ return { name: p.productName, setName: p.setName || '', quantity: p.quantity, im
   .continued-note{background:#fef3c7;color:#92400e;border:1px solid #fde68a;border-radius:6px;padding:5px 8px;font-size:11px;font-weight:700;text-align:center;}
   .page-footer{background:#f1f5f9;border-top:1px solid var(--border);padding:5px 20px;display:flex;justify-content:space-between;font-size:11px;color:var(--text-muted);}
   .page-num{font-weight:700;color:var(--primary);font-size:12px;}
-  .ship-memo-badge{display:block;background:#fefce8;color:#92400e;border:1.5px solid #fde68a;border-radius:5px;padding:4px 8px;font-size:11px;font-weight:700;}
 </style></head><body>${pagesHTML}</body></html>`;
   }
 
@@ -1026,6 +1279,8 @@ return { name: p.productName, setName: p.setName || '', quantity: p.quantity, im
     const ids = getVisibleLogisticsIds();
     if (!ids.length) { statusDiv.textContent = '⚠️ 発送IDが見つかりません'; return; }
     printOneBtn.disabled = printAllBtn.disabled = printChecked.disabled = true;
+    const proceed = await checkUnpaidAndWarn(ids, true);
+    if (!proceed) { printOneBtn.disabled = printAllBtn.disabled = printChecked.disabled = false; return; }
     await printWithShippingInstruction(ids);
     statusDiv.textContent = `✅ ${ids.length}件 印刷完了`;
     printOneBtn.disabled = printAllBtn.disabled = printChecked.disabled = false;
@@ -1034,6 +1289,8 @@ return { name: p.productName, setName: p.setName || '', quantity: p.quantity, im
     const ids = getVisibleLogisticsIds();
     if (!ids.length) { statusDiv.textContent = '⚠️ 発送IDが見つかりません'; return; }
     printOneBtn.disabled = printAllBtn.disabled = printChecked.disabled = true;
+    const proceed = await checkUnpaidAndWarn(ids, true);
+    if (!proceed) { printOneBtn.disabled = printAllBtn.disabled = printChecked.disabled = false; return; }
     await printWithShippingInstruction(ids);
     statusDiv.textContent = `✅ ${ids.length}件 印刷完了`;
     printOneBtn.disabled = printAllBtn.disabled = printChecked.disabled = false;
@@ -1042,6 +1299,8 @@ return { name: p.productName, setName: p.setName || '', quantity: p.quantity, im
     const ids = getCheckedLogisticsIds();
     if (!ids.length) { statusDiv.textContent = '⚠️ チェックされた発送IDがありません'; return; }
     printOneBtn.disabled = printAllBtn.disabled = printChecked.disabled = true;
+    const proceed = await checkUnpaidAndWarn(ids, true);
+    if (!proceed) { printOneBtn.disabled = printAllBtn.disabled = printChecked.disabled = false; return; }
     await printWithShippingInstruction(ids);
     statusDiv.textContent = `✅ ${ids.length}件 印刷完了`;
     printOneBtn.disabled = printAllBtn.disabled = printChecked.disabled = false;
@@ -1580,7 +1839,6 @@ async function startSearch() {
       if (dateArea) dateArea.style.display = 'block';
     }
     if (location.pathname.includes('/order')) {
-      addMedixorBtn(); // ← 追加
       const unpaidArea = document.getElementById('bcart-unpaid-area');
       if (unpaidArea) unpaidArea.style.display = 'block';
       const paymentDateArea = document.getElementById('bcart-payment-date-area');
@@ -1621,83 +1879,3 @@ async function startSearch() {
   });
 
 })();
-
-// =============================================
-  // medixor会員 一括設定
-  // =============================================
-  function addMedixorBtn() {
-    if (!location.pathname.includes('/order')) return;
-    if (document.getElementById('bcart-medixor-btn')) return;
-    const btn = document.createElement('button');
-    btn.id = 'bcart-medixor-btn';
-    btn.textContent = '🏥 medixor会員に設定';
-    btn.style.cssText = [
-      'position:fixed','bottom:20px','right:20px','z-index:99998',
-      'background:linear-gradient(135deg,#0891b2,#0e7490)','color:white',
-      'border:none','border-radius:8px','padding:10px 16px',
-      'font-size:13px','font-weight:bold','cursor:pointer',
-      'box-shadow:0 4px 12px rgba(8,145,178,0.4)',
-      'font-family:Hiragino Kaku Gothic Pro,Meiryo,sans-serif'
-    ].join(';');
-    btn.addEventListener('click', runMedixorBulk);
-    document.body.appendChild(btn);
-  }
-
-  async function runMedixorBulk() {
-    // チェックされた受注IDを取得
-    const orderIds = [];
-    document.querySelectorAll('table tbody tr').forEach(row => {
-      const cb = row.querySelector('input[type="checkbox"]');
-      if (!cb || !cb.checked) return;
-      const a = row.querySelector('a[href*="/admin/order/"]');
-      if (!a) return;
-      const m = a.href.match(/\/admin\/order\/(\d+)\//);
-      if (m) orderIds.push(m[1]);
-    });
-    if (!orderIds.length) { alert('受注をチェックしてください'); return; }
-    if (!confirm(`${orderIds.length}件をmedixor会員に設定しますか？`)) return;
-
-    const btn = document.getElementById('bcart-medixor-btn');
-    btn.disabled = true;
-    let success = 0;
-    for (let i = 0; i < orderIds.length; i++) {
-      const id = orderIds[i];
-      btn.textContent = `🏥 処理中… (${i+1}/${orderIds.length})`;
-      try {
-        // 編集ページを取得してフォーム全体を取得
-        const res = await fetch(`${location.origin}/admin/order/${id}/edit`, { credentials: 'same-origin' });
-        const text = await res.text();
-        const doc = new DOMParser().parseFromString(text, 'text/html');
-        const form = doc.querySelector('form');
-        if (!form) continue;
-        const fd = new FormData();
-        // 既存フォーム値をコピー
-        doc.querySelectorAll('input[name], select[name], textarea[name]').forEach(el => {
-          if (!el.name || el.name === '_token') return;
-          if (el.type === 'checkbox' || el.type === 'radio') {
-            if (el.checked) fd.append(el.name, el.value);
-          } else {
-            fd.append(el.name, el.value || '');
-          }
-        });
-        // CSRFトークン
-        const token = doc.querySelector('input[name="_token"]')?.value || getCsrfToken();
-        fd.append('_token', token);
-        // medixor会員チェックを追加
-        fd.append('customer_custom[37][]', '会員');
-        // POST送信
-        const postRes = await fetch(`${location.origin}/admin/order/${id}/edit`, {
-          method: 'POST',
-          credentials: 'same-origin',
-          body: fd,
-        });
-        if (postRes.ok) success++;
-      } catch(e) {
-        console.error('エラー:', id, e);
-      }
-      await new Promise(r => setTimeout(r, 500));
-    }
-    btn.textContent = '🏥 medixor会員に設定';
-    btn.disabled = false;
-    alert(`✅ ${success}/${orderIds.length}件 完了しました`);
-  }
