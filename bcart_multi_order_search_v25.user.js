@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bカート 複数受注番号まとめて検索 v25（発送指示書デザイン統合）
 // @namespace    http://tampermonkey.net/
-// @version      25.78
+// @version      25.79
 // @description  複数受注番号の絞り込み・納品書印刷・ドラッグ移動・ポップアップ時自動非表示
 // @author       You
 // @match        https://*.bcart.jp/admin/order*
@@ -1013,8 +1013,8 @@
     const productsWithImages = await Promise.all(
       productPromises.map(async p => {
         const imgUrl = p.productId ? await fetchProductImage(p.productId) : '';
-        const imgSrc = imgUrl ? await fetchImageAsBase64(imgUrl) : '';
-        return { name: p.productName, setName: p.setName || '', quantity: p.quantity, imgSrc, productId: p.productId };
+        
+        return { name: p.productName, setName: p.setName || '', quantity: p.quantity, imgSrc: imgUrl, productId: p.productId };
       })
     );
     products.push(...productsWithImages.filter(p => p.name && p.name.length > 0));
