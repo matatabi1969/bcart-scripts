@@ -1,12 +1,13 @@
 // ==UserScript==
 // @name         Bカート 複数受注番号まとめて検索 v25（発送指示書デザイン統合）
 // @namespace    http://tampermonkey.net/
-// @version      25.79
-// @description  複数受注番号の絞り込み・納品書印刷・ドラッグ移動・ポップアップ時自動非表示
+// @version      25.80
+// @description  複数受注番号の絞り込み・納品書印刷・ドラッグ移動・ポップアップ時自動非表示・会員ID抽出
 // @author       You
 // @match        https://*.bcart.jp/admin/order*
 // @match        https://*.bcart.jp/admin/logistics*
 // @match        https://*.bcart.jp/admin/order/list*
+// @match        https://*.bcart.jp/admin/customer/list*
 // @updateURL    https://raw.githubusercontent.com/matatabi1969/bcart-scripts/main/bcart_multi_order_search_v25.user.js
 // @downloadURL  https://raw.githubusercontent.com/matatabi1969/bcart-scripts/main/bcart_multi_order_search_v25.user.js
 // @grant        none
@@ -304,6 +305,12 @@
           </div>
           <button id="bcart-credit-search-btn" style="width:100%;background:linear-gradient(135deg,#7c3aed,#5b21b6);color:white;border:none;border-radius:6px;padding:8px 0;font-size:12px;font-weight:bold;cursor:pointer;">🔍 クレジット払いを全件抽出</button>
         </div>
+      </div>
+      <div id="bcart-member-area" style="display:none;margin-top:10px;">
+        <div class="print-title">🆔 会員IDで抽出</div>
+        <textarea id="bcart-member-id-input" placeholder="例：&#10;1001&#10;1002&#10;1003" style="width:100%;height:80px;border:1px solid #cbd5e1;border-radius:6px;padding:8px;font-size:13px;resize:vertical;box-sizing:border-box;color:#1e293b;line-height:1.6;outline:none;"></textarea>
+        <div class="bcart-hint">※ 1行に1つ、会員ID（顧客番号）を入力</div>
+        <button id="bcart-member-search-btn" style="width:100%;background:linear-gradient(135deg,#16a34a,#15803d);color:white;border:none;border-radius:6px;padding:8px 0;font-size:12px;font-weight:bold;cursor:pointer;">🔍 会員IDで全件抽出</button>
       </div>
 
       <button id="bcart-reset-btn">✕ 絞り込みを解除する</button>
@@ -1013,7 +1020,7 @@
     const productsWithImages = await Promise.all(
       productPromises.map(async p => {
         const imgUrl = p.productId ? await fetchProductImage(p.productId) : '';
-        
+
         return { name: p.productName, setName: p.setName || '', quantity: p.quantity, imgSrc: imgUrl, productId: p.productId };
       })
     );
@@ -1766,6 +1773,81 @@ async function startSearch() {
     resetBtn.style.display = 'block';
   }
 
+  // =============================================
+  // 会員一覧 全件スキャン共通処理（受注一覧とはテーブル構造が異なるため専用実装）
+  // =============================================
+  async function runCustomerSearch(memberIds) {
+    const label = `🆔 会員ID抽出（${memberIds.length}件指定）`;
+    statusDiv.textContent = `🔍 ${label} 検索中…`;
+    progressWrap.style.display = 'block';
+    progressBar.style.width = '5%';
+    const allRows = [];
+    const idsClean = memberIds.map(n => n.replace(/\s+/g, ''));
+
+    const matchRow = (row) => {
+      const rowText = row.textContent.replace(/\s+/g, '');
+      return idsClean.some(id => rowText.includes(id));
+    };
+
+    try {
+      const firstRes = await fetch(`${location.origin}/admin/customer/list?limit=100&page=1`, { credentials: 'same-origin' });
+      const firstText = await firstRes.text();
+      const firstDoc  = new DOMParser().parseFromString(firstText, 'text/html');
+
+      const totalStr = firstDoc.body.innerHTML;
+      const totalMatch = totalStr.indexOf("件中") > -1 ? totalStr.substring(0, totalStr.indexOf("件中")).trim().match(/([0-9, ]+)$/) : null;
+      const totalCount = totalMatch ? parseInt(totalMatch[1].replace(/[, ]/g,'')) : 0;
+      const firstRows  = firstDoc.querySelectorAll('table tbody tr');
+      const rowsPerPage = firstRows.length || 25;
+      const totalPages  = totalCount ? Math.ceil(totalCount / rowsPerPage) : 1;
+
+      firstRows.forEach(row => { if (matchRow(row)) allRows.push(row.outerHTML); });
+      progressBar.style.width = `${Math.round(1/totalPages*100)}%`;
+
+      for (let page = 2; page <= totalPages; page++) {
+        statusDiv.textContent = `🔍 ${label} (${page}/${totalPages}ページ)`;
+        progressBar.style.width = `${Math.round(page/totalPages*100)}%`;
+        try {
+          const res  = await fetch(`${location.origin}/admin/customer/list?limit=100&page=${page}`, { credentials: 'same-origin' });
+          const text = await res.text();
+          const doc  = new DOMParser().parseFromString(text, 'text/html');
+          doc.querySelectorAll('table tbody tr').forEach(row => { if (matchRow(row)) allRows.push(row.outerHTML); });
+        } catch(e) { console.error(`ページ${page}取得エラー:`, e); }
+        await new Promise(r => setTimeout(r, 300));
+      }
+    } catch(e) {
+      statusDiv.textContent = '⚠️ 検索に失敗しました';
+      return;
+    }
+
+    const tbody = document.querySelector('table tbody');
+    if (tbody && allRows.length) {
+      tbody.innerHTML = allRows.join('');
+      tbody.querySelectorAll('tr').forEach(r => r.classList.add('bcart-highlight'));
+    } else if (tbody) {
+      const colCount = (document.querySelectorAll('table thead th').length) || 10;
+      tbody.innerHTML = `<tr><td colspan="${colCount}" style="text-align:center;padding:20px;color:#64748b;">該当する会員が見つかりませんでした</td></tr>`;
+    }
+
+    progressBar.style.width = '100%';
+    statusDiv.textContent = `✅ ${label}：${allRows.length}件`;
+    filterBanner.style.display = 'block';
+    filterBanner.innerHTML = `<b>🔍 会員IDで絞り込み表示中</b><br>入力：${memberIds.length}件 ／ 表示：${allRows.length}件`;
+    resetBtn.style.display = 'block';
+  }
+
+  const memberSearchBtn = document.getElementById('bcart-member-search-btn');
+  if (memberSearchBtn) {
+    memberSearchBtn.addEventListener('click', async () => {
+      const raw = document.getElementById('bcart-member-id-input').value.trim();
+      if (!raw) { statusDiv.textContent = '⚠️ 会員IDを入力してください'; return; }
+      const ids = [...new Set(raw.split('\n').map(s => s.trim()).filter(Boolean))];
+      memberSearchBtn.disabled = true;
+      await runCustomerSearch(ids);
+      memberSearchBtn.disabled = false;
+    });
+  }
+
 
   const unpaidOpenBtn   = document.getElementById('bcart-unpaid-open-btn');
   const unpaidPicker    = document.getElementById('bcart-unpaid-picker');
@@ -1847,6 +1929,10 @@ async function startSearch() {
       if (creditArea) creditArea.style.display = 'block';
 
     }
+    if (location.pathname.includes('/customer')) {
+      const memberArea = document.getElementById('bcart-member-area');
+      if (memberArea) memberArea.style.display = 'block';
+    }
     const saved = loadState();
     if (saved && saved.orderNumbers && saved.orderNumbers.length) {
       restoreBanner.style.display = 'block'; restoreBanner.textContent = `🔄 前回の絞り込み（${saved.orderNumbers.length}件）を復元中…`;
@@ -1869,6 +1955,10 @@ async function startSearch() {
       if (location.pathname.includes('/order')) {
         const unpaidArea = document.getElementById('bcart-unpaid-area');
         if (unpaidArea) unpaidArea.style.display = 'block';
+      }
+      if (location.pathname.includes('/customer')) {
+        const memberArea = document.getElementById('bcart-member-area');
+        if (memberArea) memberArea.style.display = 'block';
       }
       const saved = loadState();
       if (saved && saved.orderNumbers && saved.orderNumbers.length) {
