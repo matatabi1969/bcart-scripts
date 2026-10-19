@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bカート 複数受注番号まとめて検索 v25（発送指示書デザイン統合）
 // @namespace    http://tampermonkey.net/
-// @version      25.82
+// @version      25.83
 // @description  複数受注番号の絞り込み・納品書印刷・ドラッグ移動・ポップアップ時自動非表示・会員ID抽出
 // @author       You
 // @match        https://*.bcart.jp/admin/order*
@@ -58,6 +58,87 @@
     } catch(e) {
       console.error('[GAS通知] エラー:', e);
     }
+  }
+
+  // =============================================
+  // 使用状況の記録（v25.83）
+  // 誰がどのバージョンを使っているかを、記録専用GAS（利用状況ログ）へ1日1回送信
+  // USAGE_LOG_URL に記録用GASのWebアプリURLを設定してください（空なら送信しません）
+  // =============================================
+  const USAGE_LOG_URL = '';
+  const USER_NAME_KEY = 'bcart_user_name';
+  const USAGE_LAST_KEY = 'bcart_usage_last';
+  const USER_CHOICES = ['塩津', '上郷', '田中', '坂口'];
+
+  function getScriptVersion() {
+    try { return GM_info.script.version; } catch(e) { return '不明'; }
+  }
+  function getUserName() {
+    try { return localStorage.getItem(USER_NAME_KEY) || ''; } catch(e) { return ''; }
+  }
+  function setUserName(name) {
+    try { localStorage.setItem(USER_NAME_KEY, name); } catch(e) {}
+  }
+
+  // 利用者名の選択画面（初回のみ／パネルから変更可）
+  function askUserName(current) {
+    return new Promise(resolve => {
+      document.getElementById('bcart-user-modal')?.remove();
+      const modal = document.createElement('div');
+      modal.id = 'bcart-user-modal';
+      modal.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.5);z-index:9999999;display:flex;align-items:center;justify-content:center;font-family:Hiragino Kaku Gothic Pro,Meiryo,sans-serif;';
+      const btns = USER_CHOICES.map(n =>
+        `<button data-name="${n}" style="padding:10px 0;border:1.5px solid ${n === current ? '#3a7bd5' : '#cbd5e1'};background:${n === current ? '#eff6ff' : 'white'};border-radius:8px;font-size:14px;font-weight:bold;cursor:pointer;color:#1e293b;">${n}</button>`
+      ).join('');
+      modal.innerHTML = `
+        <div style="background:white;border-radius:12px;box-shadow:0 8px 32px rgba(0,0,0,0.3);padding:22px;width:90%;max-width:340px;border:3px solid #3a7bd5;">
+          <div style="color:#2563b0;font-size:15px;font-weight:bold;margin-bottom:6px;">👤 このPCの利用者を選んでください</div>
+          <div style="font-size:12px;color:#64748b;margin-bottom:14px;">スクリプトの利用状況（バージョン）の確認に使います。最初の1回だけ表示されます。</div>
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:10px;">${btns}</div>
+          <div style="display:flex;gap:6px;">
+            <input id="bcart-user-other" placeholder="その他（名前を入力）" style="flex:1;padding:8px;border:1.5px solid #cbd5e1;border-radius:6px;font-size:13px;">
+            <button id="bcart-user-other-ok" style="padding:0 14px;background:linear-gradient(135deg,#3a7bd5,#2563b0);color:white;border:none;border-radius:6px;font-weight:bold;cursor:pointer;">決定</button>
+          </div>
+        </div>`;
+      document.body.appendChild(modal);
+      const done = name => { modal.remove(); resolve(name); };
+      modal.querySelectorAll('button[data-name]').forEach(b => b.addEventListener('click', () => done(b.dataset.name)));
+      document.getElementById('bcart-user-other-ok').addEventListener('click', () => {
+        const v = document.getElementById('bcart-user-other').value.trim();
+        if (v) done(v);
+      });
+    });
+  }
+
+  function sendUsageLog(force = false) {
+    if (!USAGE_LOG_URL) return;
+    const name = getUserName();
+    if (!name) return;
+    const version = getScriptVersion();
+    const today = new Date().toLocaleDateString('ja-JP');
+    const stamp = `${today}|${version}|${name}`;
+    try { if (!force && localStorage.getItem(USAGE_LAST_KEY) === stamp) return; } catch(e) {}
+    const ua = navigator.userAgent;
+    const browser = /Edg\//.test(ua) ? 'Edge' : /Chrome\//.test(ua) ? 'Chrome' : /Firefox\//.test(ua) ? 'Firefox' : 'その他';
+    const usage = JSON.stringify({ name, version, site: location.host, page: location.pathname, browser });
+    fetch(USAGE_LOG_URL, {
+      method: 'POST',
+      mode: 'no-cors',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: 'usage=' + encodeURIComponent(usage),
+    }).then(() => {
+      try { localStorage.setItem(USAGE_LAST_KEY, stamp); } catch(e) {}
+      console.log('[利用状況] 記録しました:', name, version);
+    }).catch(e => console.error('[利用状況] 送信エラー:', e));
+  }
+
+  async function initUsageLog() {
+    if (!USAGE_LOG_URL) return;
+    if (!getUserName()) {
+      const name = await askUserName('');
+      setUserName(name);
+    }
+    sendUsageLog();
   }
 
   const style = document.createElement('style');
@@ -314,9 +395,29 @@
       </div>
 
       <button id="bcart-reset-btn">✕ 絞り込みを解除する</button>
+      <div id="bcart-user-footer" style="margin-top:10px;padding-top:8px;border-top:1px solid #e2e8f0;font-size:11px;color:#94a3b8;display:flex;justify-content:space-between;align-items:center;">
+        <span>v<span id="bcart-footer-ver"></span>・利用者：<span id="bcart-footer-user">未設定</span></span>
+        <a href="#" id="bcart-user-change" style="color:#3a7bd5;text-decoration:none;">変更</a>
+      </div>
     </div>
   `;
   document.body.appendChild(panel);
+
+  // 利用者表示・変更
+  (function() {
+    const verEl = document.getElementById('bcart-footer-ver');
+    const userEl = document.getElementById('bcart-footer-user');
+    verEl.textContent = getScriptVersion();
+    userEl.textContent = getUserName() || '未設定';
+    document.getElementById('bcart-user-change').addEventListener('click', async e => {
+      e.preventDefault();
+      const name = await askUserName(getUserName());
+      setUserName(name);
+      userEl.textContent = name;
+      sendUsageLog(true);
+    });
+    initUsageLog().then(() => { userEl.textContent = getUserName() || '未設定'; });
+  })();
 
   // 未入金警告モーダル
   const warnModal = document.createElement('div');
