@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bカート 複数受注番号まとめて検索 v25（発送指示書デザイン統合）
 // @namespace    http://tampermonkey.net/
-// @version      25.83
+// @version      25.84
 // @description  複数受注番号の絞り込み・納品書印刷・ドラッグ移動・ポップアップ時自動非表示・会員ID抽出
 // @author       You
 // @match        https://*.bcart.jp/admin/order*
@@ -65,7 +65,7 @@
   // 誰がどのバージョンを使っているかを、記録専用GAS（利用状況ログ）へ1日1回送信
   // USAGE_LOG_URL に記録用GASのWebアプリURLを設定してください（空なら送信しません）
   // =============================================
-  const USAGE_LOG_URL = '';
+  const USAGE_LOG_URL = 'https://script.google.com/macros/s/AKfycbxVzsv-KPTexWUID3Km1ZmPfF6oN-hf84limAdx_a4H_NmuRgH_Q5EOnnPvp3lhtFn_/exec';
   const USER_NAME_KEY = 'bcart_user_name';
   const USAGE_LAST_KEY = 'bcart_usage_last';
   const USER_CHOICES = ['塩津', '上郷', '田中', '坂口'];
