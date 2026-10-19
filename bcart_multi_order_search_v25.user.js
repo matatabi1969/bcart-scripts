@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bカート 複数受注番号まとめて検索 v25（発送指示書デザイン統合）
 // @namespace    http://tampermonkey.net/
-// @version      25.80
+// @version      25.82
 // @description  複数受注番号の絞り込み・納品書印刷・ドラッグ移動・ポップアップ時自動非表示・会員ID抽出
 // @author       You
 // @match        https://*.bcart.jp/admin/order*
@@ -544,6 +544,119 @@
     }
   });
   invoiceIframeObserver.observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['src'] });
+
+  // =============================================
+  // Bカート標準の納品書作成画面（出荷）でも発送日・納品日の入力を必須にする（v25.82）
+  // iframe: /admin/invoice/logistics?...  内の「作成」ボタン・submitを横取りし、
+  // 日付入力 → 出荷情報へ反映 → 元の作成処理を実行
+  // =============================================
+  function collectLogisticsIdsFromInvoice(iframe, form) {
+    const ids = new Set();
+    if (form) {
+      try {
+        for (const [key, val] of new FormData(form).entries()) {
+          if (/logistics_id|^id$|^ids/.test(key)) String(val).split(/[,\s]+/).forEach(v => { if (/^\d+$/.test(v)) ids.add(v); });
+        }
+      } catch(e) {}
+    }
+    if (!ids.size) {
+      const src = iframe.getAttribute('src') || '';
+      const qs = src.includes('?') ? src.split('?')[1] : '';
+      new URLSearchParams(qs).forEach((val, key) => {
+        if (/logistics_id|^id$|^ids/.test(key)) String(val).split(/[,\s]+/).forEach(v => { if (/^\d+$/.test(v)) ids.add(v); });
+      });
+    }
+    return [...ids];
+  }
+
+  function hookNativeInvoiceIframe(iframe) {
+    let doc;
+    try { doc = iframe.contentDocument; } catch(e) { return; }
+    if (!doc || !doc.body || doc._bcartDateHooked) return;
+    doc._bcartDateHooked = true;
+
+    let bypass = false;   // 日付設定後の再実行時はスルー
+    let busy = false;
+
+    const isSubmitter = el => {
+      if (!el) return false;
+      const btn = el.closest('button, input[type="submit"], input[type="button"]');
+      if (!btn) return null;
+      const label = (btn.value || btn.textContent || '').trim();
+      if (btn.type === 'submit' || btn.name === 'submit' || /作成|印刷|発行/.test(label)) return btn;
+      return null;
+    };
+
+    async function gate(btn, form) {
+      if (busy) return;
+      busy = true;
+      try {
+        const ids = collectLogisticsIdsFromInvoice(iframe, form);
+        if (!ids.length) {
+          alert('発送IDを特定できなかったため、発送日・納品日を設定できません。\nパネルの印刷ボタンから印刷してください。');
+          return;
+        }
+        const dates = await askPrintDates(ids.length);
+        if (!dates) return; // キャンセル → 作成しない
+
+        const failed = [];
+        for (const id of ids) {
+          try { if (!(await applyDateToLogistics(id, dates.shipDate, dates.arrivalDate))) failed.push(id); }
+          catch(e) { console.error('日付設定エラー:', id, e); failed.push(id); }
+          await new Promise(r => setTimeout(r, 300));
+        }
+        if (failed.length && !confirm(`次の発送IDで日付を設定できませんでした:\n${failed.join(', ')}\n\nこのまま納品書を作成しますか？`)) return;
+
+        // 元の作成処理を実行
+        bypass = true;
+        try {
+          if (btn) btn.click();
+          else if (form && form.requestSubmit) form.requestSubmit();
+          else if (form) form.submit();
+        } finally {
+          setTimeout(() => { bypass = false; }, 500);
+        }
+      } finally {
+        busy = false;
+      }
+    }
+
+    // ボタンクリックを横取り（JS処理型のボタンにも対応）
+    doc.addEventListener('click', e => {
+      if (bypass) return;
+      const btn = isSubmitter(e.target);
+      if (!btn) return;
+      const form = btn.form || btn.closest('form');
+      e.preventDefault();
+      e.stopImmediatePropagation();
+      gate(btn, form);
+    }, true);
+
+    // Enterキー等によるsubmitも横取り
+    doc.addEventListener('submit', e => {
+      if (bypass) return;
+      e.preventDefault();
+      e.stopImmediatePropagation();
+      gate(e.submitter || null, e.target);
+    }, true);
+
+    console.log('[発送日・納品日チェック] 納品書作成画面にフックしました');
+  }
+
+  function watchNativeInvoiceIframes() {
+    document.querySelectorAll('iframe[src*="/admin/invoice/logistics"]').forEach(iframe => {
+      if (!iframe._bcartDateLoadHooked) {
+        iframe._bcartDateLoadHooked = true;
+        iframe.addEventListener('load', () => hookNativeInvoiceIframe(iframe));
+      }
+      try {
+        if (iframe.contentDocument && iframe.contentDocument.readyState === 'complete') hookNativeInvoiceIframe(iframe);
+      } catch(e) {}
+    });
+  }
+  new MutationObserver(watchNativeInvoiceIframes)
+    .observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['src'] });
+  watchNativeInvoiceIframes();
 
   // タブ切り替え
   document.querySelectorAll('.bcart-tab').forEach(tab => {
@@ -1281,36 +1394,107 @@
     }
   }
 
+  // =============================================
+  // 印刷前の発送日・納品日入力モーダル（v25.81）
+  // 出荷一覧で納品書を印刷する前に、発送日・納品日の入力を必須にする
+  // =============================================
+  function askPrintDates(count) {
+    return new Promise(resolve => {
+      document.getElementById('bcart-print-date-modal')?.remove();
+      const today = new Date();
+      const tomorrow = new Date(today); tomorrow.setDate(today.getDate() + 1);
+      const toInput = d => d.getFullYear() + '-' + String(d.getMonth()+1).padStart(2,'0') + '-' + String(d.getDate()).padStart(2,'0');
+
+      const modal = document.createElement('div');
+      modal.id = 'bcart-print-date-modal';
+      modal.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.5);z-index:9999999;display:flex;align-items:center;justify-content:center;font-family:Hiragino Kaku Gothic Pro,Meiryo,sans-serif;';
+      modal.innerHTML = `
+        <div style="background:white;border-radius:12px;box-shadow:0 8px 32px rgba(0,0,0,0.3);padding:24px;width:90%;max-width:380px;border:3px solid #0891b2;">
+          <div style="color:#0e7490;font-size:16px;font-weight:bold;margin-bottom:6px;">📅 発送日・納品日を入力</div>
+          <div style="font-size:12px;color:#64748b;margin-bottom:14px;">印刷する ${count} 件の出荷に設定してから納品書を印刷します。</div>
+          <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px;">
+            <label style="min-width:48px;font-size:13px;font-weight:bold;color:#334155;">発送日</label>
+            <input type="date" id="bcart-pd-ship" value="${toInput(today)}" style="flex:1;padding:6px 8px;border:1.5px solid #cbd5e1;border-radius:6px;font-size:14px;">
+          </div>
+          <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px;">
+            <label style="min-width:48px;font-size:13px;font-weight:bold;color:#334155;">納品日</label>
+            <input type="date" id="bcart-pd-arrival" value="${toInput(tomorrow)}" style="flex:1;padding:6px 8px;border:1.5px solid #cbd5e1;border-radius:6px;font-size:14px;">
+          </div>
+          <div id="bcart-pd-error" style="color:#dc2626;font-size:12px;min-height:18px;margin-bottom:8px;"></div>
+          <div style="display:flex;gap:8px;">
+            <button id="bcart-pd-cancel" style="flex:1;background:#f1f5f9;color:#475569;border:1px solid #cbd5e1;border-radius:8px;padding:10px;font-size:13px;font-weight:bold;cursor:pointer;">キャンセル</button>
+            <button id="bcart-pd-ok" style="flex:1;background:linear-gradient(135deg,#0891b2,#0e7490);color:white;border:none;border-radius:8px;padding:10px;font-size:13px;font-weight:bold;cursor:pointer;">設定して印刷</button>
+          </div>
+        </div>
+      `;
+      document.body.appendChild(modal);
+
+      const shipEl = document.getElementById('bcart-pd-ship');
+      const arrivalEl = document.getElementById('bcart-pd-arrival');
+      const errEl = document.getElementById('bcart-pd-error');
+      const close = result => { modal.remove(); resolve(result); };
+
+      document.getElementById('bcart-pd-cancel').addEventListener('click', () => close(null));
+      document.getElementById('bcart-pd-ok').addEventListener('click', () => {
+        const shipDate = shipEl.value, arrivalDate = arrivalEl.value;
+        if (!shipDate || !arrivalDate) { errEl.textContent = '⚠️ 発送日と納品日の両方を入力してください'; return; }
+        if (arrivalDate < shipDate) { errEl.textContent = '⚠️ 納品日が発送日より前になっています'; return; }
+        close({ shipDate, arrivalDate });
+      });
+      shipEl.focus();
+    });
+  }
+
+  // 印刷共通処理：未入金チェック → 日付入力 → 日付反映 → 印刷
+  async function runPrintFlow(ids) {
+    const setBtns = d => { printOneBtn.disabled = printAllBtn.disabled = printChecked.disabled = d; };
+    setBtns(true);
+    try {
+      const proceed = await checkUnpaidAndWarn(ids, true);
+      if (!proceed) return;
+
+      const dates = await askPrintDates(ids.length);
+      if (!dates) { statusDiv.textContent = '印刷をキャンセルしました'; return; }
+
+      const failed = [];
+      for (let i = 0; i < ids.length; i++) {
+        statusDiv.textContent = `📅 日付設定中… (${i + 1}/${ids.length}) ID: ${ids[i]}`;
+        try {
+          const ok = await applyDateToLogistics(ids[i], dates.shipDate, dates.arrivalDate);
+          if (!ok) failed.push(ids[i]);
+        } catch(e) {
+          console.error('日付設定エラー:', ids[i], e);
+          failed.push(ids[i]);
+        }
+        await new Promise(r => setTimeout(r, 400));
+      }
+      if (failed.length) {
+        const cont = confirm(`次の発送IDで日付を設定できませんでした:\n${failed.join(', ')}\n\nこのまま印刷を続けますか？`);
+        if (!cont) { statusDiv.textContent = `⚠️ 日付設定に失敗した件があるため中止しました（${failed.length}件）`; return; }
+      }
+
+      await printWithShippingInstruction(ids);
+      statusDiv.textContent = `✅ ${ids.length}件 印刷完了（発送日 ${dates.shipDate} / 納品日 ${dates.arrivalDate}）`;
+    } finally {
+      setBtns(false);
+    }
+  }
+
   // 印刷ボタン
   printOneBtn.addEventListener('click', async () => {
     const ids = getVisibleLogisticsIds();
     if (!ids.length) { statusDiv.textContent = '⚠️ 発送IDが見つかりません'; return; }
-    printOneBtn.disabled = printAllBtn.disabled = printChecked.disabled = true;
-    const proceed = await checkUnpaidAndWarn(ids, true);
-    if (!proceed) { printOneBtn.disabled = printAllBtn.disabled = printChecked.disabled = false; return; }
-    await printWithShippingInstruction(ids);
-    statusDiv.textContent = `✅ ${ids.length}件 印刷完了`;
-    printOneBtn.disabled = printAllBtn.disabled = printChecked.disabled = false;
+    await runPrintFlow(ids);
   });
   printAllBtn.addEventListener('click', async () => {
     const ids = getVisibleLogisticsIds();
     if (!ids.length) { statusDiv.textContent = '⚠️ 発送IDが見つかりません'; return; }
-    printOneBtn.disabled = printAllBtn.disabled = printChecked.disabled = true;
-    const proceed = await checkUnpaidAndWarn(ids, true);
-    if (!proceed) { printOneBtn.disabled = printAllBtn.disabled = printChecked.disabled = false; return; }
-    await printWithShippingInstruction(ids);
-    statusDiv.textContent = `✅ ${ids.length}件 印刷完了`;
-    printOneBtn.disabled = printAllBtn.disabled = printChecked.disabled = false;
+    await runPrintFlow(ids);
   });
   printChecked.addEventListener('click', async () => {
     const ids = getCheckedLogisticsIds();
     if (!ids.length) { statusDiv.textContent = '⚠️ チェックされた発送IDがありません'; return; }
-    printOneBtn.disabled = printAllBtn.disabled = printChecked.disabled = true;
-    const proceed = await checkUnpaidAndWarn(ids, true);
-    if (!proceed) { printOneBtn.disabled = printAllBtn.disabled = printChecked.disabled = false; return; }
-    await printWithShippingInstruction(ids);
-    statusDiv.textContent = `✅ ${ids.length}件 印刷完了`;
-    printOneBtn.disabled = printAllBtn.disabled = printChecked.disabled = false;
+    await runPrintFlow(ids);
   });
 
   // =============================================
