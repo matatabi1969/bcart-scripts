@@ -1,12 +1,14 @@
 // ==UserScript==
 // @name         bカート 入金日 クレジットボタン追加
 // @namespace    http://tampermonkey.net/
-// @version      8.0
+// @version      8.1
 // @description  入金日ポップアップに「日付選択」「クレジット」ボタンを追加
 // @match        https://pitto.i15.bcart.jp/admin/order/list*
 // @match        https://medixor.i16.bcart.jp/admin/order/list*
 // @grant        none
 // @run-at       document-idle
+// @updateURL    https://raw.githubusercontent.com/matatabi1969/bcart-scripts/main/bcart_nyukinbi_credit_button.user.js
+// @downloadURL  https://raw.githubusercontent.com/matatabi1969/bcart-scripts/main/bcart_nyukinbi_credit_button.user.js
 // ==/UserScript==
 
 (function() {
