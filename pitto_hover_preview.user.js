@@ -1,12 +1,14 @@
 // ==UserScript==
 // @name         PITTO 受注ホバープレビュー v3.11
-// @version      3.11
+// @version      3.12
 // @description  受注一覧・出荷一覧で番号にカーソルを乗せると内容をポップアップ表示
 // @match        https://pitto.i15.bcart.jp/admin/order/list*
 // @match        https://pitto.i15.bcart.jp/admin/logistics/list*
 // @match        https://pitto.i15.bcart.jp/admin/customer/*/view*
 // @grant        GM_xmlhttpRequest
 // @connect      pitto.i15.bcart.jp
+// @updateURL    https://raw.githubusercontent.com/matatabi1969/bcart-scripts/main/pitto_hover_preview.user.js
+// @downloadURL  https://raw.githubusercontent.com/matatabi1969/bcart-scripts/main/pitto_hover_preview.user.js
 // ==/UserScript==
 
 (function () {
