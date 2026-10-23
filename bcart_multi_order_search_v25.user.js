@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bカート 複数受注番号まとめて検索 v25（発送指示書デザイン統合）
 // @namespace    http://tampermonkey.net/
-// @version      25.84
+// @version      25.86
 // @description  複数受注番号の絞り込み・納品書印刷・ドラッグ移動・ポップアップ時自動非表示・会員ID抽出
 // @author       You
 // @match        https://*.bcart.jp/admin/order*
@@ -670,6 +670,142 @@
     return [...ids];
   }
 
+  // =============================================
+  // 受注管理（受注単位）の納品書作成でも発送日・納品日を入力（v25.85）
+  // iframe: /admin/invoice/invoice?oId={受注ID}&is_modal=1
+  // =============================================
+  function collectOrderIdsFromInvoice(iframe, form) {
+    const ids = new Set();
+    const add = val => String(val).split(/[,\s]+/).forEach(v => { if (/^\d+$/.test(v)) ids.add(v); });
+    if (form) {
+      try { for (const [key, val] of new FormData(form).entries()) if (/^oId$|order_id|^oIds?\[?\]?$/i.test(key)) add(val); } catch(e) {}
+    }
+    if (!ids.size) {
+      const src = iframe.getAttribute('src') || '';
+      const qs = src.includes('?') ? src.split('?')[1] : '';
+      new URLSearchParams(qs).forEach((val, key) => { if (/^oId|order_id/i.test(key)) add(val); });
+    }
+    return [...ids];
+  }
+
+  // 受注詳細画面から出荷情報（発送ID・商品・発送状況・発送日・納品日）を取得
+  async function fetchOrderShipments(orderId) {
+    const res = await fetch(`${location.origin}/admin/order/${orderId}/view`, { credentials: 'same-origin' });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const doc = new DOMParser().parseFromString(await res.text(), 'text/html');
+
+    let orderCode = '';
+    doc.querySelectorAll('td').forEach(td => { const t = td.textContent.trim(); if (/^\d{11,}$/.test(t) && !orderCode) orderCode = t; });
+
+    const countIds = el => (el.textContent.match(/Bカート発送ID/g) || []).length;
+    const labelOf = el => {
+      let n = el;
+      for (let d = 0; d < 3 && n; d++) {
+        let sib = n.previousElementSibling;
+        while (sib) { const t = sib.textContent.trim(); if (t) return t; sib = sib.previousElementSibling; }
+        n = n.parentElement;
+      }
+      return '';
+    };
+    const valueOf = (block, word) => {
+      const inp = Array.from(block.querySelectorAll('input')).find(i => labelOf(i).startsWith(word));
+      return inp ? inp.value.trim() : '';
+    };
+
+    const shipments = [];
+    const seen = new Set();
+    Array.from(doc.querySelectorAll('td, th, dt, div, span')).forEach(cell => {
+      if (cell.children.length || cell.textContent.trim() !== 'Bカート発送ID') return;
+      const valEl = cell.nextElementSibling;
+      const id = valEl ? valEl.textContent.trim() : '';
+      if (!/^\d{6,}$/.test(id) || seen.has(id)) return;
+      seen.add(id);
+
+      // この出荷だけを含む最大の範囲
+      let block = cell;
+      while (block.parentElement && block.parentElement !== doc.body && countIds(block.parentElement) === 1) block = block.parentElement;
+
+      const statusSel = Array.from(block.querySelectorAll('select')).find(s => Array.from(s.options).some(o => o.text.trim() === '発送済'));
+      const statusOpt = statusSel ? (Array.from(statusSel.options).find(o => o.hasAttribute('selected')) || statusSel.options[0]) : null;
+      const products = Array.from(block.querySelectorAll('a[href*="/admin/products/"]'))
+        .map(a => a.textContent.trim().replace(/\s+/g, ' ')).filter(Boolean);
+
+      shipments.push({
+        id, orderCode,
+        status: statusOpt ? statusOpt.text.trim() : '',
+        shipDate: valueOf(block, '発送日'),
+        arrivalDate: valueOf(block, '納品日'),
+        products
+      });
+    });
+    return shipments;
+  }
+
+  // 出荷を選んで発送日・納品日を入力するモーダル
+  function askOrderInvoiceDates(shipments) {
+    return new Promise(resolve => {
+      document.getElementById('bcart-order-date-modal')?.remove();
+      const today = new Date();
+      const tomorrow = new Date(today); tomorrow.setDate(today.getDate() + 1);
+      const toInput = d => d.getFullYear() + '-' + String(d.getMonth()+1).padStart(2,'0') + '-' + String(d.getDate()).padStart(2,'0');
+      const esc = t => String(t || '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+      // 初期選択：発送済でなく、日付が未入力の出荷（全部埋まっていれば全件）
+      const defaults = shipments.map(s => s.status !== '発送済' && (!s.shipDate || !s.arrivalDate));
+      if (!defaults.some(Boolean)) defaults.fill(true);
+
+      const rows = shipments.map((s, i) => `
+        <label style="display:flex;gap:10px;align-items:flex-start;padding:8px;border:1px solid #e2e8f0;border-radius:8px;margin-bottom:6px;cursor:pointer;">
+          <input type="checkbox" class="bcart-od-chk" data-id="${esc(s.id)}" ${defaults[i] ? 'checked' : ''} style="margin-top:3px;">
+          <div style="flex:1;font-size:12px;color:#334155;">
+            <div><b>出荷情報${i + 1}</b>　発送ID ${esc(s.id)}${s.status ? `　<span style="color:${s.status === '発送済' ? '#16a34a' : '#b45309'};">${esc(s.status)}</span>` : ''}</div>
+            <div style="color:#64748b;">${s.products.map(esc).join('<br>') || '（商品名を取得できませんでした）'}</div>
+            <div style="color:#64748b;">現在：発送日 ${esc(s.shipDate) || '未入力'} ／ 納品日 ${esc(s.arrivalDate) || '未入力'}</div>
+          </div>
+        </label>`).join('');
+
+      const modal = document.createElement('div');
+      modal.id = 'bcart-order-date-modal';
+      modal.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.5);z-index:9999999;display:flex;align-items:center;justify-content:center;font-family:Hiragino Kaku Gothic Pro,Meiryo,sans-serif;';
+      modal.innerHTML = `
+        <div style="background:white;border-radius:12px;box-shadow:0 8px 32px rgba(0,0,0,0.3);padding:24px;width:92%;max-width:520px;max-height:90vh;overflow:auto;border:3px solid #0891b2;">
+          <div style="color:#0e7490;font-size:16px;font-weight:bold;margin-bottom:6px;">📅 発送日・納品日を入力</div>
+          <div style="font-size:12px;color:#64748b;margin-bottom:12px;">受注番号 ${esc(shipments[0].orderCode)}：日付を設定する出荷を選んでから納品書を作成します。</div>
+          ${rows}
+          <div style="display:flex;align-items:center;gap:10px;margin:12px 0 10px;">
+            <label style="min-width:48px;font-size:13px;font-weight:bold;color:#334155;">発送日</label>
+            <input type="date" id="bcart-od-ship" value="${toInput(today)}" style="flex:1;padding:6px 8px;border:1.5px solid #cbd5e1;border-radius:6px;font-size:14px;">
+          </div>
+          <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px;">
+            <label style="min-width:48px;font-size:13px;font-weight:bold;color:#334155;">納品日</label>
+            <input type="date" id="bcart-od-arrival" value="${toInput(tomorrow)}" style="flex:1;padding:6px 8px;border:1.5px solid #cbd5e1;border-radius:6px;font-size:14px;">
+          </div>
+          <div id="bcart-od-error" style="color:#dc2626;font-size:12px;min-height:18px;margin-bottom:8px;"></div>
+          <div style="display:flex;gap:8px;">
+            <button id="bcart-od-cancel" style="flex:1;background:#f1f5f9;color:#475569;border:1px solid #cbd5e1;border-radius:8px;padding:10px;font-size:13px;font-weight:bold;cursor:pointer;">キャンセル</button>
+            <button id="bcart-od-skip" style="flex:1;background:white;color:#0e7490;border:1.5px solid #0891b2;border-radius:8px;padding:10px;font-size:13px;font-weight:bold;cursor:pointer;">日付なしで作成</button>
+            <button id="bcart-od-ok" style="flex:1;background:linear-gradient(135deg,#0891b2,#0e7490);color:white;border:none;border-radius:8px;padding:10px;font-size:13px;font-weight:bold;cursor:pointer;">設定して納品書作成</button>
+          </div>
+        </div>`;
+      document.body.appendChild(modal);
+
+      const errEl = document.getElementById('bcart-od-error');
+      const close = r => { modal.remove(); resolve(r); };
+      document.getElementById('bcart-od-cancel').addEventListener('click', () => close(null));
+      // 日付を設定せずにそのまま納品書を作成（v25.86）
+      document.getElementById('bcart-od-skip').addEventListener('click', () => close({ ids: [], shipDate: '', arrivalDate: '', skipped: true }));
+      document.getElementById('bcart-od-ok').addEventListener('click', () => {
+        const ids = Array.from(modal.querySelectorAll('.bcart-od-chk:checked')).map(c => c.dataset.id);
+        const shipDate = document.getElementById('bcart-od-ship').value;
+        const arrivalDate = document.getElementById('bcart-od-arrival').value;
+        if (!ids.length) { errEl.textContent = '⚠️ 日付を設定する出荷を1つ以上選んでください'; return; }
+        if (!shipDate || !arrivalDate) { errEl.textContent = '⚠️ 発送日と納品日の両方を入力してください'; return; }
+        if (arrivalDate < shipDate) { errEl.textContent = '⚠️ 納品日が発送日より前になっています'; return; }
+        close({ ids, shipDate, arrivalDate });
+      });
+      document.getElementById('bcart-od-ship').focus();
+    });
+  }
+
   function hookNativeInvoiceIframe(iframe) {
     let doc;
     try { doc = iframe.contentDocument; } catch(e) { return; }
@@ -692,13 +828,35 @@
       if (busy) return;
       busy = true;
       try {
-        const ids = collectLogisticsIdsFromInvoice(iframe, form);
-        if (!ids.length) {
-          alert('発送IDを特定できなかったため、発送日・納品日を設定できません。\nパネルの印刷ボタンから印刷してください。');
-          return;
+        let ids, dates;
+        if ((iframe.getAttribute('src') || '').includes('/admin/invoice/invoice')) {
+          // 受注管理（受注単位）の納品書：受注に含まれる出荷を選んで日付を設定（v25.85）
+          const orderIds = collectOrderIdsFromInvoice(iframe, form);
+          if (!orderIds.length) {
+            if (!confirm('受注を特定できなかったため、発送日・納品日を設定できません。\n日付を設定せずに納品書を作成しますか？')) return;
+          }
+          const shipments = [];
+          for (const oid of orderIds) {
+            try { shipments.push(...await fetchOrderShipments(oid)); }
+            catch(e) { console.error('出荷情報取得エラー:', oid, e); }
+          }
+          if (!shipments.length) {
+            if (!confirm('この受注の出荷情報（発送ID）を取得できなかったため、発送日・納品日を設定できません。\n日付を設定せずに納品書を作成しますか？')) return;
+            ids = []; dates = {};
+          } else {
+            const sel = await askOrderInvoiceDates(shipments);
+            if (!sel) return; // キャンセル → 作成しない
+            ids = sel.ids; dates = sel;   // 「日付なしで作成」のときは ids が空（v25.86）
+          }
+        } else {
+          ids = collectLogisticsIdsFromInvoice(iframe, form);
+          if (!ids.length) {
+            alert('発送IDを特定できなかったため、発送日・納品日を設定できません。\nパネルの印刷ボタンから印刷してください。');
+            return;
+          }
+          dates = await askPrintDates(ids.length);
+          if (!dates) return; // キャンセル → 作成しない
         }
-        const dates = await askPrintDates(ids.length);
-        if (!dates) return; // キャンセル → 作成しない
 
         const failed = [];
         for (const id of ids) {
@@ -745,7 +903,7 @@
   }
 
   function watchNativeInvoiceIframes() {
-    document.querySelectorAll('iframe[src*="/admin/invoice/logistics"]').forEach(iframe => {
+    document.querySelectorAll('iframe[src*="/admin/invoice/logistics"], iframe[src*="/admin/invoice/invoice"]').forEach(iframe => {
       if (!iframe._bcartDateLoadHooked) {
         iframe._bcartDateLoadHooked = true;
         iframe.addEventListener('load', () => hookNativeInvoiceIframe(iframe));
