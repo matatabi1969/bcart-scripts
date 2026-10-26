@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bカート 複数受注番号まとめて検索 v25（発送指示書デザイン統合）
 // @namespace    http://tampermonkey.net/
-// @version      25.86
+// @version      25.89
 // @description  複数受注番号の絞り込み・納品書印刷・ドラッグ移動・ポップアップ時自動非表示・会員ID抽出
 // @author       You
 // @match        https://*.bcart.jp/admin/order*
@@ -513,19 +513,16 @@
     if (!hasInvoiceIframe) lastCheckedIframeSrc = '';
   });
   resetObserver.observe(document.body, { childList: true, subtree: true });
-  const invoiceIframeObserver = new MutationObserver(async () => {
-    const iframes = document.querySelectorAll('iframe[src*="/admin/invoice/"]');
-    for (const iframe of iframes) {
+  // v25.88：帳票画面を開いた時点では確認せず、納品書の「作成」を押した時点で確認する
+  // 戻り値：true=作成を続ける / false=中止
+  async function checkInvoiceIframeUnpaid(iframe) {
+    {
       const src = iframe.getAttribute('src') || '';
-      console.log('[未入金チェック] iframe発見:', src);
-      // 処理中フラグで重複実行を防ぐ
-      if (iframe._checking) continue;
-      iframe._checking = true;
-      setTimeout(() => { iframe._checking = false; }, 5000);
+      console.log('[未入金チェック] 納品書作成時のチェック:', src);
 
       // 受注ID or 発送IDを取得
       const oIdMatch  = src.match(/[?&]oId=(\d+)/);
-      const lidMatch  = src.match(/[?&]id=(\d+)/);
+      const lidMatch  = src.match(/[?&](?:logistics_id|id)=(\d+)/);
 
       let orderCode = '', companyName = '', isUnpaid = false;
 
@@ -594,8 +591,9 @@
         } catch(e) { console.error('未入金チェックエラー:', e); }
       }
 
-      // 未入金の場合は警告バナーをモーダルの上に表示
-      if (isUnpaid) {
+      // 未入金の場合は警告を表示して選択を待つ
+      if (!isUnpaid) return true;
+      return await new Promise(resolve => {
         // 既存の警告があれば削除
         const existingWarn = document.getElementById('bcart-iframe-warn');
         if (existingWarn) existingWarn.remove();
@@ -618,7 +616,7 @@
             <b>受注番号：</b>${orderCode || '不明'}<br>
             <b>会社名：</b>${companyName || '不明'}
           </div>
-          <div style="font-size:12px;color:#94a3b8;margin-bottom:16px;">入金が確認されていません。印刷しますか？</div>
+          <div style="font-size:12px;color:#94a3b8;margin-bottom:16px;">入金が確認されていません。納品書を作成しますか？</div>
           <div style="display:flex;gap:8px;">
             <button id="bcart-iframe-warn-cancel" style="flex:1;background:#f1f5f9;color:#475569;border:1px solid #cbd5e1;border-radius:8px;padding:10px;font-size:13px;font-weight:bold;cursor:pointer;">キャンセル</button>
             <button id="bcart-iframe-warn-ok" style="flex:1;background:linear-gradient(135deg,#dc2626,#b91c1c);color:white;border:none;border-radius:8px;padding:10px;font-size:13px;font-weight:bold;cursor:pointer;">続けて印刷</button>
@@ -634,17 +632,16 @@
 
         document.getElementById('bcart-iframe-warn-cancel').addEventListener('click', () => {
           warn.remove(); overlay.remove();
-          // モーダルを閉じる
-          const closeBtn = document.querySelector('.modaal-close, .modal-close, [class*="close"]');
-          if (closeBtn) closeBtn.click();
+          resolve(false); // 作成しない（帳票画面はそのまま）
         });
         document.getElementById('bcart-iframe-warn-ok').addEventListener('click', () => {
           warn.remove(); overlay.remove();
+          resolve(true);
         });
-      }
+      });
     }
-  });
-  invoiceIframeObserver.observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['src'] });
+  }
+  // （v25.88で帳票画面を開いた時点の自動チェックは廃止）
 
   // =============================================
   // Bカート標準の納品書作成画面（出荷）でも発送日・納品日の入力を必須にする（v25.82）
@@ -828,6 +825,9 @@
       if (busy) return;
       busy = true;
       try {
+        // 未入金チェック（納品書の作成時のみ・v25.88）
+        if (!(await checkInvoiceIframeUnpaid(iframe))) return;
+
         let ids, dates;
         if ((iframe.getAttribute('src') || '').includes('/admin/invoice/invoice')) {
           // 受注管理（受注単位）の納品書：受注に含まれる出荷を選んで日付を設定（v25.85）
@@ -856,6 +856,7 @@
           }
           dates = await askPrintDates(ids.length);
           if (!dates) return; // キャンセル → 作成しない
+          if (dates.skipped) ids = []; // 日付なしで作成（v25.89）
         }
 
         const failed = [];
@@ -880,12 +881,34 @@
       }
     }
 
+    // 帳票の種類が納品書以外（請求書・領収書・見積書など）なら日付入力を出さない（v25.87）
+    // 納品書は pdf_type=delivery。判別できない場合は従来どおり納品書として扱う
+    const isNonDeliveryDoc = form => {
+      let type = '';
+      try { if (form) type = String(new FormData(form).get('pdf_type') || ''); } catch(e) {}
+      if (!type) {
+        const el = doc.querySelector('input[name="pdf_type"]:checked, select[name="pdf_type"], input[type="hidden"][name="pdf_type"]');
+        if (el) type = String(el.value || '');
+      }
+      if (type) return type !== 'delivery';
+      // pdf_type がない場合は、選択中の項目の表示名で判定
+      const texts = [];
+      doc.querySelectorAll('input[type="radio"]:checked').forEach(r => {
+        const lab = r.closest('label') || (r.id && doc.querySelector(`label[for="${r.id}"]`));
+        texts.push(lab ? lab.textContent : (r.nextSibling ? r.nextSibling.textContent || '' : ''));
+      });
+      doc.querySelectorAll('select').forEach(sel => { const o = sel.options[sel.selectedIndex]; if (o) texts.push(o.text); });
+      const t = texts.join(' ');
+      return /請求|領収|見積/.test(t) && !/納品/.test(t);
+    };
+
     // ボタンクリックを横取り（JS処理型のボタンにも対応）
     doc.addEventListener('click', e => {
       if (bypass) return;
       const btn = isSubmitter(e.target);
       if (!btn) return;
       const form = btn.form || btn.closest('form');
+      if (isNonDeliveryDoc(form)) return; // 請求書などはそのまま作成
       e.preventDefault();
       e.stopImmediatePropagation();
       gate(btn, form);
@@ -894,6 +917,7 @@
     // Enterキー等によるsubmitも横取り
     doc.addEventListener('submit', e => {
       if (bypass) return;
+      if (isNonDeliveryDoc(e.target)) return; // 請求書などはそのまま作成
       e.preventDefault();
       e.stopImmediatePropagation();
       gate(e.submitter || null, e.target);
@@ -1668,7 +1692,7 @@
       modal.id = 'bcart-print-date-modal';
       modal.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.5);z-index:9999999;display:flex;align-items:center;justify-content:center;font-family:Hiragino Kaku Gothic Pro,Meiryo,sans-serif;';
       modal.innerHTML = `
-        <div style="background:white;border-radius:12px;box-shadow:0 8px 32px rgba(0,0,0,0.3);padding:24px;width:90%;max-width:380px;border:3px solid #0891b2;">
+        <div style="background:white;border-radius:12px;box-shadow:0 8px 32px rgba(0,0,0,0.3);padding:24px;width:90%;max-width:440px;border:3px solid #0891b2;">
           <div style="color:#0e7490;font-size:16px;font-weight:bold;margin-bottom:6px;">📅 発送日・納品日を入力</div>
           <div style="font-size:12px;color:#64748b;margin-bottom:14px;">印刷する ${count} 件の出荷に設定してから納品書を印刷します。</div>
           <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px;">
@@ -1682,6 +1706,7 @@
           <div id="bcart-pd-error" style="color:#dc2626;font-size:12px;min-height:18px;margin-bottom:8px;"></div>
           <div style="display:flex;gap:8px;">
             <button id="bcart-pd-cancel" style="flex:1;background:#f1f5f9;color:#475569;border:1px solid #cbd5e1;border-radius:8px;padding:10px;font-size:13px;font-weight:bold;cursor:pointer;">キャンセル</button>
+            <button id="bcart-pd-skip" style="flex:1;background:white;color:#0e7490;border:1.5px solid #0891b2;border-radius:8px;padding:10px;font-size:13px;font-weight:bold;cursor:pointer;">日付なしで印刷</button>
             <button id="bcart-pd-ok" style="flex:1;background:linear-gradient(135deg,#0891b2,#0e7490);color:white;border:none;border-radius:8px;padding:10px;font-size:13px;font-weight:bold;cursor:pointer;">設定して印刷</button>
           </div>
         </div>
@@ -1694,6 +1719,8 @@
       const close = result => { modal.remove(); resolve(result); };
 
       document.getElementById('bcart-pd-cancel').addEventListener('click', () => close(null));
+      // 日付を設定せずに印刷・作成（v25.89）
+      document.getElementById('bcart-pd-skip').addEventListener('click', () => close({ shipDate: '', arrivalDate: '', skipped: true }));
       document.getElementById('bcart-pd-ok').addEventListener('click', () => {
         const shipDate = shipEl.value, arrivalDate = arrivalEl.value;
         if (!shipDate || !arrivalDate) { errEl.textContent = '⚠️ 発送日と納品日の両方を入力してください'; return; }
@@ -1716,7 +1743,8 @@
       if (!dates) { statusDiv.textContent = '印刷をキャンセルしました'; return; }
 
       const failed = [];
-      for (let i = 0; i < ids.length; i++) {
+      const dateIds = dates.skipped ? [] : ids; // 日付なしで印刷（v25.89）
+      for (let i = 0; i < dateIds.length; i++) {
         statusDiv.textContent = `📅 日付設定中… (${i + 1}/${ids.length}) ID: ${ids[i]}`;
         try {
           const ok = await applyDateToLogistics(ids[i], dates.shipDate, dates.arrivalDate);
@@ -1733,7 +1761,9 @@
       }
 
       await printWithShippingInstruction(ids);
-      statusDiv.textContent = `✅ ${ids.length}件 印刷完了（発送日 ${dates.shipDate} / 納品日 ${dates.arrivalDate}）`;
+      statusDiv.textContent = dates.skipped
+        ? `✅ ${ids.length}件 印刷完了（日付は設定していません）`
+        : `✅ ${ids.length}件 印刷完了（発送日 ${dates.shipDate} / 納品日 ${dates.arrivalDate}）`;
     } finally {
       setBtns(false);
     }
