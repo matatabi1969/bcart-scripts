@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bカート 複数受注番号まとめて検索 v25（発送指示書デザイン統合）
 // @namespace    http://tampermonkey.net/
-// @version      25.89
+// @version      25.91
 // @description  複数受注番号の絞り込み・納品書印刷・ドラッグ移動・ポップアップ時自動非表示・会員ID抽出
 // @author       You
 // @match        https://*.bcart.jp/admin/order*
@@ -1006,7 +1006,7 @@
   }
 
   // 納品書PDF生成
-  async function generateDeliveryNotePDF(id, returnBuffer = false) {
+  async function generateDeliveryNotePDF(id, returnBuffer = false, memo = '') {
     const now = new Date();
     const fd = new FormData();
     fd.append('_token', getCsrfToken());
@@ -1018,7 +1018,7 @@
     fd.append('date[m]', String(now.getMonth() + 1).padStart(2, '0'));
     fd.append('date[d]', String(now.getDate()).padStart(2, '0'));
     fd.append('text', 'この度はご注文頂きありがとうございます。下記の通り納品させて頂きます。');
-    fd.append('memo', '');
+    fd.append('memo', memo || '');  // 納品書のコメント（v25.90）
     fd.append('memo_option', '0');
     fd.append('submit', '作成');
     const res = await fetch(`${location.origin}/admin/invoice/logistics`, { method: 'POST', credentials: 'same-origin', body: fd });
@@ -1647,13 +1647,15 @@
   });
 
   // 納品書PDF＋発送指示書を合体して印刷
-  async function printWithShippingInstruction(ids) {
+  async function printWithShippingInstruction(ids, memo = '') {
+    // memo は全件共通の文字列、または { 発送ID: コメント } の形（v25.91）
+    const memoFor = id => (memo && typeof memo === 'object') ? (memo[id] || '') : (memo || '');
     const pdfBuffers = [];
     const orders = [];
     for (let i = 0; i < ids.length; i++) {
       statusDiv.textContent = `🖨 生成中… (${i + 1}/${ids.length}) ID: ${ids[i]}`;
       try {
-        pdfBuffers.push(await generateDeliveryNotePDF(ids[i], true));
+        pdfBuffers.push(await generateDeliveryNotePDF(ids[i], true, memoFor(ids[i])));
         const detail = await fetchLogisticsDetail(ids[i]);
         orders.push(detail);
       } catch(e) { console.error('取得エラー:', ids[i], e); }
@@ -1681,18 +1683,61 @@
   // 印刷前の発送日・納品日入力モーダル（v25.81）
   // 出荷一覧で納品書を印刷する前に、発送日・納品日の入力を必須にする
   // =============================================
-  function askPrintDates(count) {
+  // 出荷一覧の行から 会社名・受注番号 を取得（コメント入力欄の見出し用・v25.91）
+  function getLogisticsRowInfo(id) {
+    const info = { company: '', orderCode: '' };
+    try {
+      for (const row of document.querySelectorAll('table tbody tr')) {
+        const hit = [...row.querySelectorAll('a, td')].some(el => el.textContent.trim() === id)
+                 || [...row.querySelectorAll('input[type="checkbox"]')].some(cb => cb.value === id);
+        if (!hit) continue;
+        for (const a of row.querySelectorAll('a')) { const t = a.textContent.trim(); if (/^\d{11,}$/.test(t)) { info.orderCode = t; break; } }
+        const table = row.closest('table');
+        const ths = table ? [...table.querySelectorAll('thead th, thead td')] : [];
+        const idx = ths.findIndex(th => /配送先\s*会社名/.test(th.textContent));
+        const tds = row.querySelectorAll('td');
+        if (idx >= 0 && tds[idx]) {
+          info.company = (tds[idx].innerText || tds[idx].textContent).split('\n').map(x => x.trim()).filter(Boolean)[0] || '';
+        }
+        break;
+      }
+    } catch(e) {}
+    return info;
+  }
+
+  function askPrintDates(count, withMemo = false, ids = []) {
     return new Promise(resolve => {
       document.getElementById('bcart-print-date-modal')?.remove();
       const today = new Date();
       const tomorrow = new Date(today); tomorrow.setDate(today.getDate() + 1);
       const toInput = d => d.getFullYear() + '-' + String(d.getMonth()+1).padStart(2,'0') + '-' + String(d.getDate()).padStart(2,'0');
 
+      // コメント欄：1件なら1つ、複数なら出荷ごとに1つずつ（v25.91）
+      const escH = t => String(t || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+      const taStyle = 'width:100%;box-sizing:border-box;padding:6px 8px;border:1.5px solid #cbd5e1;border-radius:6px;font-size:13px;line-height:1.5;resize:vertical;font-family:inherit;';
+      let memoListHtml = '';
+      if (withMemo && ids.length > 1) {
+        memoListHtml = `
+          <div style="font-size:11px;color:#64748b;margin-bottom:6px;">出荷ごとに別々のコメントを入れられます。空欄の出荷はコメントなしで印刷されます。</div>
+          <div style="max-height:40vh;overflow-y:auto;border:1px solid #e2e8f0;border-radius:8px;padding:8px;background:#f8fafc;">
+            ${ids.map(id => {
+              const r = getLogisticsRowInfo(id);
+              return `<div style="margin-bottom:8px;">
+                <div style="font-size:12px;color:#334155;margin-bottom:3px;"><b>${escH(id)}</b>${r.company ? '　' + escH(r.company) : ''}${r.orderCode ? `<span style="color:#94a3b8;font-size:11px;">（受注 ${escH(r.orderCode)}）</span>` : ''}</div>
+                <textarea class="bcart-pd-memo-item" data-id="${escH(id)}" rows="2" style="${taStyle}"></textarea>
+              </div>`;
+            }).join('')}
+          </div>
+          <button type="button" id="bcart-pd-memo-copy" style="margin-top:6px;background:none;border:1px solid #cbd5e1;border-radius:6px;padding:4px 10px;font-size:11px;color:#475569;cursor:pointer;">↓ 1件目のコメントを全件にコピー</button>`;
+      } else {
+        memoListHtml = `<textarea id="bcart-pd-memo" rows="3" placeholder="例：ご不明点がございましたらお問い合わせください。" style="${taStyle}"></textarea>`;
+      }
+
       const modal = document.createElement('div');
       modal.id = 'bcart-print-date-modal';
       modal.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.5);z-index:9999999;display:flex;align-items:center;justify-content:center;font-family:Hiragino Kaku Gothic Pro,Meiryo,sans-serif;';
       modal.innerHTML = `
-        <div style="background:white;border-radius:12px;box-shadow:0 8px 32px rgba(0,0,0,0.3);padding:24px;width:90%;max-width:440px;border:3px solid #0891b2;">
+        <div style="background:white;border-radius:12px;box-shadow:0 8px 32px rgba(0,0,0,0.3);padding:24px;width:90%;max-width:${withMemo && ids.length > 1 ? 520 : 440}px;max-height:92vh;overflow-y:auto;box-sizing:border-box;border:3px solid #0891b2;">
           <div style="color:#0e7490;font-size:16px;font-weight:bold;margin-bottom:6px;">📅 発送日・納品日を入力</div>
           <div style="font-size:12px;color:#64748b;margin-bottom:14px;">印刷する ${count} 件の出荷に設定してから納品書を印刷します。</div>
           <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px;">
@@ -1702,6 +1747,10 @@
           <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px;">
             <label style="min-width:48px;font-size:13px;font-weight:bold;color:#334155;">納品日</label>
             <input type="date" id="bcart-pd-arrival" value="${toInput(tomorrow)}" style="flex:1;padding:6px 8px;border:1.5px solid #cbd5e1;border-radius:6px;font-size:14px;">
+          </div>
+          <div style="margin-bottom:8px;${withMemo ? '' : 'display:none;'}">
+            <label style="display:block;font-size:13px;font-weight:bold;color:#334155;margin-bottom:4px;">納品書のコメント <span style="font-weight:normal;color:#94a3b8;font-size:11px;">（任意）</span></label>
+            ${memoListHtml}
           </div>
           <div id="bcart-pd-error" style="color:#dc2626;font-size:12px;min-height:18px;margin-bottom:8px;"></div>
           <div style="display:flex;gap:8px;">
@@ -1716,7 +1765,25 @@
       const shipEl = document.getElementById('bcart-pd-ship');
       const arrivalEl = document.getElementById('bcart-pd-arrival');
       const errEl = document.getElementById('bcart-pd-error');
-      const close = result => { modal.remove(); resolve(result); };
+      const memoEl = document.getElementById('bcart-pd-memo');
+      const itemEls = [...modal.querySelectorAll('.bcart-pd-memo-item')];
+      if (itemEls.length) {
+        document.getElementById('bcart-pd-memo-copy').addEventListener('click', () => {
+          const v = itemEls[0].value;
+          itemEls.forEach(el => { el.value = v; });
+        });
+      }
+      const close = result => {
+        if (result) {
+          if (itemEls.length) {
+            result.memo = {};
+            itemEls.forEach(el => { const v = el.value.trim(); if (v) result.memo[el.dataset.id] = v; });
+          } else {
+            result.memo = memoEl ? memoEl.value.trim() : '';
+          }
+        }
+        modal.remove(); resolve(result);
+      };
 
       document.getElementById('bcart-pd-cancel').addEventListener('click', () => close(null));
       // 日付を設定せずに印刷・作成（v25.89）
@@ -1739,7 +1806,7 @@
       const proceed = await checkUnpaidAndWarn(ids, true);
       if (!proceed) return;
 
-      const dates = await askPrintDates(ids.length);
+      const dates = await askPrintDates(ids.length, true, ids);  // パネル印刷ではコメント欄を表示（v25.90）・出荷ごとのコメント（v25.91）
       if (!dates) { statusDiv.textContent = '印刷をキャンセルしました'; return; }
 
       const failed = [];
@@ -1760,7 +1827,7 @@
         if (!cont) { statusDiv.textContent = `⚠️ 日付設定に失敗した件があるため中止しました（${failed.length}件）`; return; }
       }
 
-      await printWithShippingInstruction(ids);
+      await printWithShippingInstruction(ids, dates.memo);
       statusDiv.textContent = dates.skipped
         ? `✅ ${ids.length}件 印刷完了（日付は設定していません）`
         : `✅ ${ids.length}件 印刷完了（発送日 ${dates.shipDate} / 納品日 ${dates.arrivalDate}）`;
