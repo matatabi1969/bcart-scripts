@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bカート 複数受注番号まとめて検索 v25（発送指示書デザイン統合）
 // @namespace    http://tampermonkey.net/
-// @version      25.91
+// @version      25.93
 // @description  複数受注番号の絞り込み・納品書印刷・ドラッグ移動・ポップアップ時自動非表示・会員ID抽出
 // @author       You
 // @match        https://*.bcart.jp/admin/order*
@@ -668,6 +668,47 @@
   }
 
   // =============================================
+  // 納品書の印刷後：受注管理シートへの入力確認（v25.92）
+  // 「はい」→ 閉じる ／「いいえ」→ 受注管理シートへのリンクを表示
+  // =============================================
+  const ORDER_SHEET_URL = 'https://docs.google.com/spreadsheets/d/1ya6PgMBfmbLamf4ByuYijPbMS4Qzt5dUspiuZwPBido/edit?gid=1529015826#gid=1529015826';
+
+  function showSheetEntryNotice() {
+    document.getElementById('bcart-sheet-notice')?.remove();
+    const modal = document.createElement('div');
+    modal.id = 'bcart-sheet-notice';
+    modal.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.45);z-index:9999999;display:flex;align-items:center;justify-content:center;font-family:Hiragino Kaku Gothic Pro,Meiryo,sans-serif;';
+    modal.innerHTML = `
+      <div style="background:white;border-radius:12px;box-shadow:0 8px 32px rgba(0,0,0,0.3);padding:24px;width:90%;max-width:420px;border:3px solid #0891b2;">
+        <div style="color:#0e7490;font-size:16px;font-weight:bold;margin-bottom:12px;">📋 受注管理シートの入力確認</div>
+        <div style="font-size:14px;color:#334155;margin-bottom:16px;">受注管理シートに<b>納品日・納品数</b>を入力しましたか？</div>
+        <div id="bcart-sn-ask" style="display:flex;gap:8px;">
+          <button id="bcart-sn-no" style="flex:1;background:#f1f5f9;color:#475569;border:1px solid #cbd5e1;border-radius:8px;padding:10px;font-size:14px;font-weight:bold;cursor:pointer;">いいえ<span style="display:block;font-size:11px;font-weight:normal;margin-top:2px;">（受注管理シートを開く）</span></button>
+          <button id="bcart-sn-yes" style="flex:1;background:linear-gradient(135deg,#0891b2,#0e7490);color:white;border:none;border-radius:8px;padding:10px;font-size:14px;font-weight:bold;cursor:pointer;">はい</button>
+        </div>
+        <div id="bcart-sn-link" style="display:none;">
+          <div style="font-size:13px;color:#dc2626;font-weight:bold;margin-bottom:10px;">⚠️ 下のリンクから受注管理シートを開いて、納品日・納品数を入力してください。</div>
+          <a id="bcart-sn-open" href="${ORDER_SHEET_URL}" target="_blank" rel="noopener"
+             style="display:block;text-align:center;background:linear-gradient(135deg,#0891b2,#0e7490);color:white;border-radius:8px;padding:10px;font-size:14px;font-weight:bold;text-decoration:none;margin-bottom:8px;">📄 受注管理シートを開く</a>
+          <div style="font-size:11px;color:#64748b;word-break:break-all;margin-bottom:10px;">${ORDER_SHEET_URL}</div>
+          <button id="bcart-sn-close" style="width:100%;background:#f1f5f9;color:#475569;border:1px solid #cbd5e1;border-radius:8px;padding:8px;font-size:13px;cursor:pointer;">閉じる</button>
+        </div>
+      </div>`;
+    document.body.appendChild(modal);
+    document.getElementById('bcart-sn-yes').addEventListener('click', () => modal.remove());
+    // 「いいえ」→ 受注管理シートを別タブで開く（v25.93）
+    // ポップアップがブロックされた場合のみ、リンクを表示して押してもらう
+    document.getElementById('bcart-sn-no').addEventListener('click', () => {
+      const w = window.open(ORDER_SHEET_URL, '_blank');
+      if (w) { try { w.opener = null; } catch(e) {} modal.remove(); return; }
+      document.getElementById('bcart-sn-ask').style.display = 'none';
+      document.getElementById('bcart-sn-link').style.display = 'block';
+    });
+    document.getElementById('bcart-sn-open').addEventListener('click', () => setTimeout(() => modal.remove(), 300));
+    document.getElementById('bcart-sn-close').addEventListener('click', () => modal.remove());
+  }
+
+  // =============================================
   // 受注管理（受注単位）の納品書作成でも発送日・納品日を入力（v25.85）
   // iframe: /admin/invoice/invoice?oId={受注ID}&is_modal=1
   // =============================================
@@ -876,6 +917,8 @@
         } finally {
           setTimeout(() => { bypass = false; }, 500);
         }
+        // 受注管理シートへの入力確認（v25.92）
+        setTimeout(showSheetEntryNotice, 1500);
       } finally {
         busy = false;
       }
@@ -1828,6 +1871,8 @@
       }
 
       await printWithShippingInstruction(ids, dates.memo);
+      // 受注管理シートへの入力確認（v25.92）
+      showSheetEntryNotice();
       statusDiv.textContent = dates.skipped
         ? `✅ ${ids.length}件 印刷完了（日付は設定していません）`
         : `✅ ${ids.length}件 印刷完了（発送日 ${dates.shipDate} / 納品日 ${dates.arrivalDate}）`;
