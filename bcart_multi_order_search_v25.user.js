@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bカート 複数受注番号まとめて検索 v25（発送指示書デザイン統合）
 // @namespace    http://tampermonkey.net/
-// @version      25.93
+// @version      25.94
 // @description  複数受注番号の絞り込み・納品書印刷・ドラッグ移動・ポップアップ時自動非表示・会員ID抽出
 // @author       You
 // @match        https://*.bcart.jp/admin/order*
@@ -17,6 +17,59 @@
   'use strict';
 
   const STORAGE_KEY = 'bcart_multi_search_v4';
+
+  // =============================================
+  // 新しいバージョンのお知らせ（v25.94）
+  // Tampermonkeyを開かなくても、Bカートの画面上で更新を案内する
+  // GitHubの最新版を30分ごとに確認し、新しければ画面上部に表示
+  // =============================================
+  (function checkScriptUpdate() {
+    const RAW_URL = 'https://raw.githubusercontent.com/matatabi1969/bcart-scripts/main/bcart_multi_order_search_v25.user.js';
+    const KEY = 'bcart_v25_update_check';
+    const cur = (typeof GM_info !== 'undefined' && GM_info && GM_info.script && GM_info.script.version) || '';
+    if (!cur) return;
+    const cmp = (a, b) => {
+      const x = String(a).split('.').map(Number), y = String(b).split('.').map(Number);
+      for (let i = 0; i < Math.max(x.length, y.length); i++) { const d = (x[i] || 0) - (y[i] || 0); if (d) return d > 0 ? 1 : -1; }
+      return 0;
+    };
+    const show = latest => {
+      if (document.getElementById('bcart-update-banner')) return;
+      const bar = document.createElement('div');
+      bar.id = 'bcart-update-banner';
+      bar.style.cssText = 'position:fixed;top:0;left:50%;transform:translateX(-50%);z-index:2147483647;background:#dc2626;color:white;padding:10px 16px;border-radius:0 0 10px 10px;box-shadow:0 4px 16px rgba(0,0,0,0.25);font-family:Hiragino Kaku Gothic Pro,Meiryo,sans-serif;font-size:13px;display:flex;align-items:center;gap:10px;max-width:92vw;';
+      bar.innerHTML = `
+        <span id="bcart-update-msg">🔄 Bカート拡張スクリプトの<b>新しいバージョン（${latest}）</b>があります（現在 ${cur}）</span>
+        <button id="bcart-update-go" style="background:white;color:#dc2626;border:none;border-radius:6px;padding:6px 12px;font-size:13px;font-weight:bold;cursor:pointer;white-space:nowrap;">今すぐ更新</button>
+        <button id="bcart-update-x" title="あとで" style="background:none;color:white;border:none;font-size:16px;cursor:pointer;">✕</button>`;
+      document.body.appendChild(bar);
+      document.getElementById('bcart-update-go').addEventListener('click', () => {
+        window.open(RAW_URL, '_blank');
+        document.getElementById('bcart-update-msg').innerHTML = '開いた画面で <b>「更新」</b> を押したあと、このページを再読み込みしてください';
+        const btn = document.getElementById('bcart-update-go');
+        btn.textContent = '再読み込み';
+        btn.onclick = () => location.reload();
+      }, { once: true });
+      document.getElementById('bcart-update-x').addEventListener('click', () => bar.remove());
+    };
+
+    let cache = {};
+    try { cache = JSON.parse(localStorage.getItem(KEY) || '{}'); } catch(e) {}
+    const run = () => {
+      if (cache.latest && cmp(cache.latest, cur) > 0) show(cache.latest);
+      if (cache.at && Date.now() - cache.at < 30 * 60 * 1000) return; // 30分以内は再確認しない
+      fetch(RAW_URL + '?t=' + Date.now(), { cache: 'no-store' })
+        .then(r => r.ok ? r.text() : '')
+        .then(t => {
+          const m = t.match(/@version\s+([\d.]+)/);
+          if (!m) return;
+          try { localStorage.setItem(KEY, JSON.stringify({ at: Date.now(), latest: m[1] })); } catch(e) {}
+          if (cmp(m[1], cur) > 0) show(m[1]);
+        })
+        .catch(() => {});
+    };
+    if (document.body) run(); else window.addEventListener('DOMContentLoaded', run);
+  })();
 
   // =============================================
   // GAS連携設定
