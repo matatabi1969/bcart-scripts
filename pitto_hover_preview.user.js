@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         PITTO 受注ホバープレビュー v3.11
-// @version      3.12
-// @description  受注一覧・出荷一覧で番号にカーソルを乗せると内容をポップアップ表示
+// @name         PITTO 受注ホバープレビュー v3.14.2
+// @version      3.14.2
+// @description  受注一覧・出荷一覧で番号にカーソルを乗せると内容をポップアップ表示（v3.14：受注一覧の「管理者用メモ」「お客様からの連絡事項」「メモ：あり」に乗せると中身を表示）
 // @match        https://pitto.i15.bcart.jp/admin/order/list*
 // @match        https://pitto.i15.bcart.jp/admin/logistics/list*
 // @match        https://pitto.i15.bcart.jp/admin/customer/*/view*
@@ -87,13 +87,64 @@
 
   // ---- ユーティリティ ----
   function getTableValue(doc, labelText) {
-    for (const td of doc.querySelectorAll('td')) {
+    for (const td of doc.querySelectorAll('th, td')) {
       if (td.textContent.trim() === labelText) {
         const next = td.nextElementSibling;
         return next ? next.textContent.trim() : '-';
       }
     }
     return '-';
+  }
+
+  // ---- 管理者用メモ・お客様からの連絡事項（v3.13） ----
+  function escapeHtml(str) {
+    return String(str).replace(/[&<>"']/g, c => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[c]));
+  }
+
+  // 見出しの文字（空白・コロンを除く）が候補と一致する欄を探し、その値を返す
+  function getLabeledText(doc, labels) {
+    const norm = t => (t || '').replace(/[\s:：]/g, '');
+    const readValue = el => {
+      if (!el) return '';
+      const ta = el.matches('textarea') ? el : el.querySelector('textarea');
+      if (ta) return (ta.value || ta.textContent || '').trim();
+      const inp = el.matches('input') ? el : el.querySelector('input[type="text"], input:not([type])');
+      if (inp) return (inp.getAttribute('value') || inp.value || '').trim();
+      return (el.innerText || el.textContent || '').trim();
+    };
+    const cands = Array.from(doc.querySelectorAll('th, td, dt, label, div, span, p, h3, h4, h5'));
+    for (const label of labels) {
+      for (const el of cands) {
+        if (norm(el.textContent) !== norm(label)) continue;
+        // ① すぐ後ろの要素（表の右側の欄、ラベルの下の入力欄）
+        let val = readValue(el.nextElementSibling);
+        // ② 見出しを囲む枠の中の入力欄（「メモ（※非公開）」のような管理者用の欄）
+        //    入力欄が1つだけの枠に限る（空欄のとき、隣の「お客様への連絡事項」などを拾わないため）
+        let box = el.parentElement;
+        for (let i = 0; !val && box && i < 2; i++, box = box.parentElement) {
+          const fields = box.querySelectorAll('textarea, input[type="text"], input:not([type])');
+          if (fields.length === 1) { val = readValue(fields[0]); break; }
+          if (fields.length > 1) break;
+        }
+        if (val) return val;
+      }
+    }
+    return '';
+  }
+
+  function buildMemoSection(doc) {
+    const adminMemo = getLabeledText(doc, ['メモ（※非公開）', 'メモ(※非公開)']);
+    const custMemo  = getLabeledText(doc, ['お客様からの連絡事項', '連絡事項']);
+    if (!adminMemo && !custMemo) return '';
+    const box = (title, text, color, bg) => text ? `
+      <div style="border-left:3px solid ${color};background:${bg};padding:5px 9px;margin-bottom:6px;border-radius:0 4px 4px 0;">
+        <div style="font-size:11px;font-weight:bold;color:${color};margin-bottom:2px;">${title}</div>
+        <div style="font-size:12px;white-space:pre-wrap;word-break:break-word;">${escapeHtml(text)}</div>
+      </div>` : '';
+    return `<div style="margin-bottom:10px;">
+      ${box('📝 メモ（※非公開）', adminMemo, '#b45309', '#fffbeb')}
+      ${box('💬 お客様からの連絡事項', custMemo, '#1d4ed8', '#eff6ff')}
+    </div>`;
   }
 
   function extractProductRows(table) {
@@ -376,6 +427,7 @@
           🏥 <strong>${company}</strong>
           ${staff && staff !== '-' ? `<span style="color:#555;font-size:12px;">　${staff}</span>` : ''}
         </div>
+        ${buildMemoSection(doc)}
         ${bodyHtml}
         <div style="border-top:2px solid #1a73e8;margin-top:8px;padding:8px 0 10px;">
           <div style="display:flex;justify-content:space-between;font-size:12px;">
@@ -695,7 +747,73 @@
     link.addEventListener('mouseleave', () => { hideTimer = setTimeout(hidePopup, 400); });
   }
 
+  // 受注一覧の「あり」に乗せると中身を表示（v3.14.1）
+  // 中身は一覧ページ内の非表示の枠（「あり」をクリックしたときに開くもの）にあるので、取りに行かずにそのまま使う
+  // 列は見出しの横位置で判定（分納などで行がずれても正しい列を拾うため）
+  const MEMO_KINDS = {
+    admin:  { title: '📝 管理者用メモ',           color: '#b45309', bg: '#fffbeb' },
+    cust:   { title: '💬 お客様からの連絡事項',   color: '#1d4ed8', bg: '#eff6ff' },
+    member: { title: '👤 会員メモ',               color: '#047857', bg: '#ecfdf5' },
+  };
+
+  function modalText(href) {
+    const el = href && href.startsWith('#') ? document.getElementById(href.slice(1)) : null;
+    if (!el) return '';
+    const c = el.cloneNode(true);
+    c.querySelectorAll('h1, h2, h3, h4, h5, h6, button').forEach(h => h.remove());  // 枠の見出し・閉じるボタンは除く
+    c.querySelectorAll('br').forEach(b => b.replaceWith('\n'));
+    c.querySelectorAll('p, div, li').forEach(b => b.append('\n'));
+    // 枠の中の「受注番号・受注日時・Bカート会員ID」の行は一覧で分かるので除く（v3.14.2）
+    return c.textContent.split('\n').map(l => l.trim()).filter(Boolean)
+      .filter(l => !/^(受注番号|受注日時|Bカート会員ID|会員ID)\s*[：:]/.test(l)).join('\n');
+  }
+
+  function buildModalMemoHtml(kind, text) {
+    const k = MEMO_KINDS[kind];
+    return `
+      <div style="padding:10px 14px;">
+        <div style="border-left:3px solid ${k.color};background:${k.bg};padding:6px 10px;border-radius:0 4px 4px 0;">
+          <div style="font-size:11px;font-weight:bold;color:${k.color};margin-bottom:3px;">${k.title}</div>
+          <div style="font-size:13px;white-space:pre-wrap;word-break:break-word;">${text ? escapeHtml(text) : '<span style="color:#999;">（内容がありません）</span>'}</div>
+        </div>
+      </div>`;
+  }
+
+  function attachMemoColumnHover() {
+    if (!/\/admin\/order\/list/.test(location.pathname)) return;
+    const cols = [];
+    document.querySelectorAll('th').forEach(th => {
+      const t = th.textContent.replace(/\s/g, '');
+      const kind = t === '管理者用メモ' ? 'admin' : t === 'お客様からの連絡事項' ? 'cust' : '';
+      if (!kind) return;
+      const r = th.getBoundingClientRect();
+      if (r.width > 0) cols.push({ kind, left: r.left, right: r.right });
+    });
+    document.querySelectorAll('a.modaal[href^="#"]').forEach(a => {
+      if (a.dataset.memoHover || a.textContent.trim() !== 'あり') return;
+      const href = a.getAttribute('href');
+      let kind = /customer-memo/.test(href) ? 'member' : '';
+      if (!kind) {
+        const r = a.getBoundingClientRect();
+        if (!r.width) return;
+        const mid = (r.left + r.right) / 2;
+        const col = cols.find(c => mid >= c.left && mid <= c.right);
+        if (!col) return;
+        kind = col.kind;
+      }
+      a.dataset.memoHover = '1';
+      a.addEventListener('mouseenter', e => {
+        clearTimeout(hideTimer);
+        currentUrl = 'memo:' + href;
+        showPopup(e.clientX, e.clientY, buildModalMemoHtml(kind, modalText(href)));
+      });
+      a.addEventListener('mousemove', e => { if (popup.style.display === 'block') updatePosition(e.clientX, e.clientY); });
+      a.addEventListener('mouseleave', () => { hideTimer = setTimeout(hidePopup, 400); });
+    });
+  }
+
   function attachHoverEvents() {
+    attachMemoColumnHover();
     document.querySelectorAll('a[href*="/admin/order/"]').forEach(link => {
       const href = link.getAttribute('href') || '';
       if (!/\/admin\/order\/\d+\/view/.test(href)) return;
