@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bカート 複数受注番号まとめて検索 v25（発送指示書デザイン統合）
 // @namespace    http://tampermonkey.net/
-// @version      25.94
+// @version      26.1.0
 // @description  複数受注番号の絞り込み・納品書印刷・ドラッグ移動・ポップアップ時自動非表示・会員ID抽出
 // @author       You
 // @match        https://*.bcart.jp/admin/order*
@@ -13,19 +13,32 @@
 // @grant        none
 // ==/UserScript==
 
+// ==ChangeLog==
+// 更新のお知らせ（画面上部の赤い帯）に表示する内容です。
+// 1行に1つ「バージョン | 内容」の形で書きます。新しいバージョンを上に追加してください。
+// 使っている人より新しいバージョンの行だけが表示されます。
+// 26.1.0 | 更新のお知らせに、更新内容と問い合わせ先が表示されるようになりました
+// 26.1.0 | 納品書を印刷したあと「受注管理シート → 発送指示書 → 送り状CSV」の順に確認が出ます（受注一覧・出荷一覧の両方）
+// 26.1.0 | 発送指示書を印刷するか「印刷する／印刷しない」で選べます
+// 26.1.0 | 送り状CSV（ゆうパック・ヤマト）を作るか選べます。「はい」でこのPCのダウンロードフォルダに保存されます（メールは届きません）
+// 26.1.0 | クール便の商品はゆうパック用CSVから外れ、ヤマト用CSVで冷蔵・着払いを分けて出力します
+// ==/ChangeLog==
+
 (function () {
   'use strict';
 
   const STORAGE_KEY = 'bcart_multi_search_v4';
 
   // =============================================
-  // 新しいバージョンのお知らせ（v25.94）
+  // 新しいバージョンのお知らせ（v25.94、v26.1.0で更新内容・問い合わせ先を追加）
   // Tampermonkeyを開かなくても、Bカートの画面上で更新を案内する
   // GitHubの最新版を30分ごとに確認し、新しければ画面上部に表示
+  // 更新内容は最新版の ==ChangeLog== から、今のバージョンより新しい行だけを表示
   // =============================================
   (function checkScriptUpdate() {
     const RAW_URL = 'https://raw.githubusercontent.com/matatabi1969/bcart-scripts/main/bcart_multi_order_search_v25.user.js';
     const KEY = 'bcart_v25_update_check';
+    const CONTACT = '田中';   // お知らせに出す問い合わせ先
     const cur = (typeof GM_info !== 'undefined' && GM_info && GM_info.script && GM_info.script.version) || '';
     if (!cur) return;
     const cmp = (a, b) => {
@@ -33,15 +46,35 @@
       for (let i = 0; i < Math.max(x.length, y.length); i++) { const d = (x[i] || 0) - (y[i] || 0); if (d) return d > 0 ? 1 : -1; }
       return 0;
     };
-    const show = latest => {
+    const esc = t => String(t || '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+    // 最新版の本文から更新履歴を取り出す → [{ v, text }]
+    const parseNotes = text => {
+      const m = String(text || '').match(/==ChangeLog==([\s\S]*?)==\/ChangeLog==/);
+      if (!m) return [];
+      return m[1].split('\n')
+        .map(l => l.replace(/^\s*\/\/\s?/, '').trim().match(/^(\d+(?:\.\d+)*)\s*\|\s*(.+)$/))
+        .filter(Boolean)
+        .map(x => ({ v: x[1], text: x[2] }))
+        .slice(0, 40);
+    };
+    const show = (latest, notes) => {
       if (document.getElementById('bcart-update-banner')) return;
+      const mine = (notes || []).filter(n => cmp(n.v, cur) > 0).slice(0, 8);
+      const list = mine.length
+        ? `<div style="font-weight:bold;margin:2px 0 4px;">更新内容</div>
+           <ul style="margin:0;padding-left:18px;line-height:1.6;">${mine.map(n => `<li>${esc(n.text)}</li>`).join('')}</ul>`
+        : '';
       const bar = document.createElement('div');
       bar.id = 'bcart-update-banner';
-      bar.style.cssText = 'position:fixed;top:0;left:50%;transform:translateX(-50%);z-index:2147483647;background:#dc2626;color:white;padding:10px 16px;border-radius:0 0 10px 10px;box-shadow:0 4px 16px rgba(0,0,0,0.25);font-family:Hiragino Kaku Gothic Pro,Meiryo,sans-serif;font-size:13px;display:flex;align-items:center;gap:10px;max-width:92vw;';
+      bar.style.cssText = 'position:fixed;top:0;left:50%;transform:translateX(-50%);z-index:2147483647;background:#dc2626;color:white;padding:10px 16px 12px;border-radius:0 0 10px 10px;box-shadow:0 4px 16px rgba(0,0,0,0.25);font-family:Hiragino Kaku Gothic Pro,Meiryo,sans-serif;font-size:13px;width:max-content;max-width:min(720px,92vw);box-sizing:border-box;';
       bar.innerHTML = `
-        <span id="bcart-update-msg">🔄 Bカート拡張スクリプトの<b>新しいバージョン（${latest}）</b>があります（現在 ${cur}）</span>
-        <button id="bcart-update-go" style="background:white;color:#dc2626;border:none;border-radius:6px;padding:6px 12px;font-size:13px;font-weight:bold;cursor:pointer;white-space:nowrap;">今すぐ更新</button>
-        <button id="bcart-update-x" title="あとで" style="background:none;color:white;border:none;font-size:16px;cursor:pointer;">✕</button>`;
+        <div style="display:flex;align-items:center;gap:10px;">
+          <span id="bcart-update-msg" style="flex:1;">🔄 Bカート拡張スクリプトの<b>新しいバージョン（${esc(latest)}）</b>があります（現在 ${esc(cur)}）</span>
+          <button id="bcart-update-go" style="background:white;color:#dc2626;border:none;border-radius:6px;padding:6px 12px;font-size:13px;font-weight:bold;cursor:pointer;white-space:nowrap;">今すぐ更新</button>
+          <button id="bcart-update-x" title="あとで" style="background:none;color:white;border:none;font-size:16px;cursor:pointer;">✕</button>
+        </div>
+        ${list ? `<div style="margin-top:8px;padding:8px 10px;background:rgba(255,255,255,0.14);border-radius:6px;">${list}</div>` : ''}
+        <div style="margin-top:8px;font-size:12px;">ご不明点は${esc(CONTACT)}までお問い合わせください。</div>`;
       document.body.appendChild(bar);
       document.getElementById('bcart-update-go').addEventListener('click', () => {
         window.open(RAW_URL, '_blank');
@@ -56,15 +89,16 @@
     let cache = {};
     try { cache = JSON.parse(localStorage.getItem(KEY) || '{}'); } catch(e) {}
     const run = () => {
-      if (cache.latest && cmp(cache.latest, cur) > 0) show(cache.latest);
+      if (cache.latest && cmp(cache.latest, cur) > 0) show(cache.latest, cache.notes);
       if (cache.at && Date.now() - cache.at < 30 * 60 * 1000) return; // 30分以内は再確認しない
       fetch(RAW_URL + '?t=' + Date.now(), { cache: 'no-store' })
         .then(r => r.ok ? r.text() : '')
         .then(t => {
           const m = t.match(/@version\s+([\d.]+)/);
           if (!m) return;
-          try { localStorage.setItem(KEY, JSON.stringify({ at: Date.now(), latest: m[1] })); } catch(e) {}
-          if (cmp(m[1], cur) > 0) show(m[1]);
+          const notes = parseNotes(t);
+          try { localStorage.setItem(KEY, JSON.stringify({ at: Date.now(), latest: m[1], notes })); } catch(e) {}
+          if (cmp(m[1], cur) > 0) show(m[1], notes);
         })
         .catch(() => {});
     };
@@ -78,6 +112,143 @@
   // =============================================
   const GAS_URL = 'https://script.google.com/macros/s/AKfycbwZkAZDpo7kGQDnVoyg7YxFbzsFhatASvQTc-zVbrTne53o9RjG4fPRpjT328NXrre4/exec';
 
+  // 出荷を送り状の単位に分ける（v25.95）
+  //   通常商品           → ゆうプリR ＋ B2（送り状種類 0:発払い ／ クール区分 0:通常）
+  //   ヤマトクール元払い → B2のみ  （送り状種類 0:発払い ／ クール区分 2:冷蔵）
+  //   冷蔵ヤマト着払い   → B2のみ  （送り状種類 5:着払い ／ クール区分 2:冷蔵）
+  // 商品が取れなかった出荷は、今までどおり通常扱い
+  function buildShipmentsForGAS(orders) {
+    const TYPES = {
+      normal:       { b2Payment: '0', b2Cool: '0', toYupuri: true  },
+      cool_prepaid: { b2Payment: '0', b2Cool: '2', toYupuri: false },
+      cold_collect: { b2Payment: '5', b2Cool: '2', toYupuri: false },
+    };
+    const out = [];
+    orders.forEach(o => {
+      const base = {
+        logisticsId: o.logisticsId || '', orderCode: o.orderCode || '', companyName: o.companyName || '',
+        personName: o.personName || '', tel: o.tel || '', zip: o.zip || '',
+        address1: o.address1 || '', address2: o.address2 || '', address3: o.address3 || '',
+      };
+      const prods = o.products || [];
+      const kinds = new Set(prods.map(p => {
+        const id = String(p.productId || '');
+        return COLD_PRODUCT_IDS.has(id) ? 'cold_collect' : COOL_PREPAID_IDS.has(id) ? 'cool_prepaid' : 'normal';
+      }));
+      if (!kinds.size) kinds.add('normal');
+      ['normal', 'cool_prepaid', 'cold_collect'].forEach(k => {
+        if (kinds.has(k)) out.push({ ...base, shipType: k, ...TYPES[k] });
+      });
+    });
+    return out;
+  }
+
+  // =============================================
+  // 送り状CSVをこのPCにダウンロード（v25.98）
+  // GAS（発送指示書CSV保存・メール通知 v1.2.3）と同じ形式で作る。文字コードはUTF-8（BOM付き）
+  //   ゆうプリR：119列・見出しなし・非冷蔵の分だけ
+  //   B2クラウド：40列・見出しあり・1行＝1送り状（クール区分・送り状種類あり）
+  // =============================================
+  const CSV_SENDER = {
+    zip:     '5590034',
+    address: '大阪市住之江区南港北2-1-10',
+    address2:'ATC　ITM　９F　K-2',
+    name:    'リアス株式会社',
+    tel:     '06-4703-8008',
+    tel2:    '0647038007',
+    email:   'info@lias.jp',
+  };
+  const ymd_ = (d, sep) => d.getFullYear() + sep + String(d.getMonth() + 1).padStart(2, '0') + sep + String(d.getDate()).padStart(2, '0');
+
+  function buildYupuriCsv_(shipments, now) {
+    const tomorrow = new Date(now.getTime() + 86400000);
+    const rows = shipments.filter(s => s.toYupuri).map(o => {
+      const row = new Array(119).fill('');
+      row[0]  = o.logisticsId || '';   // お客様管理番号（発送ID）
+      row[1]  = ymd_(now, '/');        // 発送日
+      row[2]  = ymd_(tomorrow, '/');   // 納品日（発送日+1日）
+      row[7] = row[8] = row[9] = row[10] = '0';
+      row[14] = o.zip || '';           // 郵便番号
+      row[15] = o.address1 || '';      // お届け先住所1
+      row[16] = o.address2 || '';      // お届け先住所2
+      row[17] = o.address3 || '';      // 建物名
+      row[18] = o.companyName || '';   // 会社名
+      row[19] = o.personName || '';    // 担当者名
+      row[20] = '0';
+      row[21] = o.tel || '';           // 電話番号
+      row[30] = '0';
+      row[31] = CSV_SENDER.zip;
+      row[32] = CSV_SENDER.address;
+      row[33] = CSV_SENDER.address2;
+      row[35] = CSV_SENDER.name;
+      row[37] = '0';
+      row[38] = CSV_SENDER.tel;
+      row[39] = CSV_SENDER.email;
+      row[56] = '1'; row[57] = '0'; row[58] = '1'; row[59] = '0'; row[60] = '1';
+      row[74] = o.orderCode || '';     // 受注番号
+      return row.map((v, i) => ([14, 31, 74].indexOf(i) >= 0 && v) ? ('"' + v + '"') : v).join(',');
+    });
+    return { count: rows.length, csv: '﻿' + rows.join('\r\n') };
+  }
+
+  function buildB2Csv_(shipments, now) {
+    const header = '出荷予定日,お客様管理番号,送り状種類,お届け先コード,お届け先 電話番号,お届け先 電話番号枝番,お届け先名,お届け先郵便番号,お届け先住所,お届け先建物名（アパートマンション名）,お届け先会社・部門１,お届け先会社・部門２,お届け先名略称カナ,ご依頼主コード,ご依頼主電話番号,ご依頼主 電話番号枝番,ご依頼主名,ご依頼主郵便番号,ご依頼主住所,ご依頼主建物名 （アパートマンション名）,ご依頼主名略称カナ,品名コード１,品名１,品名コード2,品名2,荷扱い１,荷扱い2,記事,お届け予定（指定）日,配達時間帯区分,コレクト代金引換額,コレクト内消費税,営業所止置き,営業所コード,個数口枠の印字,発行枚数,ご請求先顧客コード,ご請求先分類コード,運賃管理番号,クール区分';
+    const rows = shipments.map(o => {
+      const cols = [
+        ymd_(now, '/'),                                         // 出荷予定日
+        o.logisticsId || '',                                    // お客様管理番号
+        o.b2Payment || '0',                                     // 送り状種類（0:発払い／5:着払い）
+        '',
+        o.tel || '',                                            // お届け先電話番号
+        '',
+        o.personName || '',                                     // お届け先名
+        o.zip ? o.zip.replace(/-/g, '').replace(/〒/g, '') : '', // お届け先郵便番号
+        (o.address1 || '') + (o.address2 || ''),                // お届け先住所
+        o.address3 || '',                                       // 建物名
+        o.companyName || '',                                    // お届け先会社
+        '', '',
+        CSV_SENDER.tel2,                                        // ご依頼主コード
+        CSV_SENDER.tel,                                         // ご依頼主電話番号
+        '',
+        CSV_SENDER.name,                                        // ご依頼主名
+        CSV_SENDER.zip,                                         // ご依頼主郵便番号
+        '大阪府' + CSV_SENDER.address,                          // ご依頼主住所（都道府県が必須）
+        CSV_SENDER.address2,                                    // ご依頼主建物名
+        '', '', '',                                             // 略称カナ・品名コード１・品名１（B2側で固定値）
+        '',
+        o.orderCode ? '受注番号 ' + o.orderCode : '',            // 品名2（受注番号）
+        '', '', '', '', '', '', '', '', '', '', '', '', '', '',  // 荷扱い〜運賃管理番号
+        o.b2Cool || '0',                                        // クール区分（0:通常／2:冷蔵）
+      ];
+      return cols.map(c => String(c).includes(',') ? `"${c}"` : c).join(',');
+    });
+    return { count: rows.length, csv: '﻿' + header + '\r\n' + rows.join('\r\n') };
+  }
+
+  function downloadText_(text, fileName) {
+    const url = URL.createObjectURL(new Blob([text], { type: 'text/csv;charset=utf-8' }));
+    const a = document.createElement('a');
+    a.href = url; a.download = fileName; a.style.display = 'none';
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 10000);
+  }
+
+  // 出荷情報からゆうプリR・B2クラウドのCSVを作ってダウンロード。戻り値は各件数
+  async function downloadShippingCsvs(orders) {
+    const now = new Date();
+    const shipments = buildShipmentsForGAS(orders);
+    const day = ymd_(now, '');
+    const yupuri = buildYupuriCsv_(shipments, now);
+    const b2 = buildB2Csv_(shipments, now);
+    if (yupuri.count) {
+      downloadText_(yupuri.csv, `${day}_ゆうプリR.csv`);
+      await new Promise(r => setTimeout(r, 800)); // 2つ目のダウンロードが止められないよう少し空ける
+    }
+    if (b2.count) downloadText_(b2.csv, `${day}_B2クラウド.csv`);
+    return { yupuri: yupuri.count, b2: b2.count };
+  }
+
+  // （v25.98以降は使っていない。GASへの送信に戻す場合に使う）
   function notifyGAS(orders, shippingHtml) {
     if (!GAS_URL) return;
     // 呼び出し元を確認
@@ -95,6 +266,9 @@
           address2:    o.address2    || '',
           address3:    o.address3    || '',
         })),
+        // 送り状の単位（v25.95）：1つの出荷を「通常／ヤマトクール元払い／冷蔵ヤマト着払い」に分けたもの
+        // GAS v1.2.0以降はこちらを使い、ゆうプリRは通常分だけ、B2は送り状種類・クール区分を付けて出力する
+        shipments: buildShipmentsForGAS(orders),
         shippingHtml: shippingHtml || '',
       });
       // fetchでPOST送信（form/iframe方式を廃止）
@@ -726,7 +900,9 @@
   // =============================================
   const ORDER_SHEET_URL = 'https://docs.google.com/spreadsheets/d/1ya6PgMBfmbLamf4ByuYijPbMS4Qzt5dUspiuZwPBido/edit?gid=1529015826#gid=1529015826';
 
+  // v25.96：閉じるまで待てるよう Promise を返す（このあとに発送指示書の確認を出すため）
   function showSheetEntryNotice() {
+    return new Promise(resolve => {
     document.getElementById('bcart-sheet-notice')?.remove();
     const modal = document.createElement('div');
     modal.id = 'bcart-sheet-notice';
@@ -748,17 +924,138 @@
         </div>
       </div>`;
     document.body.appendChild(modal);
-    document.getElementById('bcart-sn-yes').addEventListener('click', () => modal.remove());
+    let closed = false;
+    const done = () => { if (closed) return; closed = true; modal.remove(); resolve(); };
+    document.getElementById('bcart-sn-yes').addEventListener('click', done);
     // 「いいえ」→ 受注管理シートを別タブで開く（v25.93）
     // ポップアップがブロックされた場合のみ、リンクを表示して押してもらう
     document.getElementById('bcart-sn-no').addEventListener('click', () => {
       const w = window.open(ORDER_SHEET_URL, '_blank');
-      if (w) { try { w.opener = null; } catch(e) {} modal.remove(); return; }
+      if (w) { try { w.opener = null; } catch(e) {} done(); return; }
       document.getElementById('bcart-sn-ask').style.display = 'none';
       document.getElementById('bcart-sn-link').style.display = 'block';
     });
-    document.getElementById('bcart-sn-open').addEventListener('click', () => setTimeout(() => modal.remove(), 300));
-    document.getElementById('bcart-sn-close').addEventListener('click', () => modal.remove());
+    document.getElementById('bcart-sn-open').addEventListener('click', () => setTimeout(done, 300));
+    document.getElementById('bcart-sn-close').addEventListener('click', done);
+    });
+  }
+
+  // =============================================
+  // 納品書の印刷後：発送指示書も印刷するか確認（v25.96）
+  // 受注管理シートの確認のあとに表示する。パネル印刷・Bカート標準の納品書作成の両方で使う
+  //   ctx.orders：取得済みの出荷情報（パネル印刷）／ ctx.ids：発送IDだけ（標準画面。必要になったら取得）
+  //   v25.97：ctx を送り状CSVの確認と共有し、出荷情報の取得を1回で済ませる
+  // =============================================
+
+  // ctx.orders がなければ ctx.ids から出荷情報を取得して ctx.orders に入れる（v25.97）
+  async function ensureOrders_(ctx) {
+    if (ctx.orders) return ctx.orders;
+    const list = [];
+    for (const id of ctx.ids || []) {
+      try { list.push(await fetchLogisticsDetail(id)); }
+      catch(e) { console.error('出荷情報 取得エラー:', id, e); list.push({ logisticsId: id, orderCode: '', companyName: '（取得エラー）', products: [] }); }
+      await new Promise(r => setTimeout(r, 400));
+    }
+    ctx.orders = list;
+    return list;
+  }
+
+  // 画面下に数秒だけ出るお知らせ（v25.97）
+  function showToast_(msg, color = '#0f766e') {
+    const t = document.createElement('div');
+    t.style.cssText = `position:fixed;bottom:24px;left:50%;transform:translateX(-50%);z-index:9999999;background:${color};color:white;padding:10px 18px;border-radius:8px;box-shadow:0 4px 16px rgba(0,0,0,0.25);font-family:Hiragino Kaku Gothic Pro,Meiryo,sans-serif;font-size:13px;font-weight:bold;`;
+    t.textContent = msg;
+    document.body.appendChild(t);
+    setTimeout(() => t.remove(), 5000);
+  }
+
+  function askShippingInstPrint(ctx) {
+    return new Promise(resolve => {
+      const count = ctx.orders ? ctx.orders.length : (ctx.ids || []).length;
+      if (!count) { resolve(false); return; }
+      document.getElementById('bcart-inst-ask')?.remove();
+      const modal = document.createElement('div');
+      modal.id = 'bcart-inst-ask';
+      modal.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.45);z-index:9999999;display:flex;align-items:center;justify-content:center;font-family:Hiragino Kaku Gothic Pro,Meiryo,sans-serif;';
+      modal.innerHTML = `
+        <div style="background:white;border-radius:12px;box-shadow:0 8px 32px rgba(0,0,0,0.3);padding:24px;width:90%;max-width:420px;border:3px solid #7c3aed;">
+          <div style="color:#5b21b6;font-size:16px;font-weight:bold;margin-bottom:12px;">📋 発送指示書の印刷</div>
+          <div style="font-size:14px;color:#334155;margin-bottom:16px;">納品書を印刷した <b>${count}件</b> の<b>発送指示書</b>も印刷しますか？</div>
+          <div style="display:flex;gap:8px;">
+            <button id="bcart-inst-no" style="flex:1;background:#f1f5f9;color:#475569;border:1px solid #cbd5e1;border-radius:8px;padding:10px;font-size:14px;font-weight:bold;cursor:pointer;">印刷しない</button>
+            <button id="bcart-inst-yes" style="flex:1;background:linear-gradient(135deg,#7c3aed,#5b21b6);color:white;border:none;border-radius:8px;padding:10px;font-size:14px;font-weight:bold;cursor:pointer;">印刷する</button>
+          </div>
+        </div>`;
+      document.body.appendChild(modal);
+
+      document.getElementById('bcart-inst-no').addEventListener('click', () => { modal.remove(); resolve(false); });
+      document.getElementById('bcart-inst-yes').addEventListener('click', async () => {
+        // ポップアップブロック対策：クリックした瞬間に別タブを開いておき、あとから中身を入れる
+        const win = window.open('', '_blank');
+        modal.remove();
+        if (!win) {
+          alert('ポップアップがブロックされたため、発送指示書を開けませんでした。\nパネルの「☑ チェックした件の発送指示書を作成」から印刷してください。');
+          resolve(false); return;
+        }
+        try { win.document.write('<p style="font-family:Meiryo,sans-serif;padding:24px;color:#475569;">📋 発送指示書を作成中です…</p>'); } catch(e) {}
+        try {
+          const list = await ensureOrders_(ctx);
+          const html = generateShippingInstructionHTML(list);
+          win.location.href = URL.createObjectURL(new Blob([html], { type: 'text/html;charset=utf-8' }));
+          await new Promise(r => setTimeout(r, 2000));
+          try { win.print(); } catch(e) {}
+          resolve(true);
+        } catch(e) {
+          console.error('発送指示書 作成エラー:', e);
+          try { win.close(); } catch(e2) {}
+          alert('発送指示書の作成に失敗しました。パネルの「☑ チェックした件の発送指示書を作成」から印刷してください。');
+          resolve(false);
+        }
+      });
+    });
+  }
+
+  // =============================================
+  // 発送指示書の確認のあと：ゆうパック・ヤマトの送り状CSVを作成するか確認（v25.97）
+  // 「はい」→ このPCにCSVをダウンロード（v25.98。GASへの送信・メールはしない）
+  // 「いいえ」→ 何もしない
+  // =============================================
+  function askCsvCreate(ctx) {
+    return new Promise(resolve => {
+      const count = ctx.orders ? ctx.orders.length : (ctx.ids || []).length;
+      if (!count) { resolve(false); return; }
+      document.getElementById('bcart-csv-ask')?.remove();
+      const modal = document.createElement('div');
+      modal.id = 'bcart-csv-ask';
+      modal.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.45);z-index:9999999;display:flex;align-items:center;justify-content:center;font-family:Hiragino Kaku Gothic Pro,Meiryo,sans-serif;';
+      modal.innerHTML = `
+        <div style="background:white;border-radius:12px;box-shadow:0 8px 32px rgba(0,0,0,0.3);padding:24px;width:90%;max-width:420px;border:3px solid #0f766e;">
+          <div style="color:#0f766e;font-size:16px;font-weight:bold;margin-bottom:12px;">📦 送り状CSVの作成</div>
+          <div style="font-size:14px;color:#334155;margin-bottom:8px;"><b>${count}件</b> の<b>ゆうパック（ゆうプリR）・ヤマト（B2クラウド）</b>のCSVを作成しますか？</div>
+          <div style="font-size:12px;color:#64748b;margin-bottom:16px;">作成したCSVは、このPCのダウンロードフォルダに保存されます。</div>
+          <div style="display:flex;gap:8px;">
+            <button id="bcart-csv-no" style="flex:1;background:#f1f5f9;color:#475569;border:1px solid #cbd5e1;border-radius:8px;padding:10px;font-size:14px;font-weight:bold;cursor:pointer;">いいえ</button>
+            <button id="bcart-csv-yes" style="flex:1;background:linear-gradient(135deg,#0d9488,#0f766e);color:white;border:none;border-radius:8px;padding:10px;font-size:14px;font-weight:bold;cursor:pointer;">はい</button>
+          </div>
+        </div>`;
+      document.body.appendChild(modal);
+
+      document.getElementById('bcart-csv-no').addEventListener('click', () => { modal.remove(); resolve(false); });
+      document.getElementById('bcart-csv-yes').addEventListener('click', async () => {
+        modal.remove();
+        try {
+          showToast_('📦 CSVを作成しています…', '#475569');
+          const list = await ensureOrders_(ctx);
+          const n = await downloadShippingCsvs(list);
+          showToast_(`📦 CSVを保存しました（ゆうプリR ${n.yupuri}件 ／ B2クラウド ${n.b2}件）`);
+          resolve(true);
+        } catch(e) {
+          console.error('送り状CSV 作成エラー:', e);
+          showToast_('⚠️ CSVの作成に失敗しました', '#dc2626');
+          resolve(false);
+        }
+      });
+    });
   }
 
   // =============================================
@@ -923,6 +1220,7 @@
         if (!(await checkInvoiceIframeUnpaid(iframe))) return;
 
         let ids, dates;
+        let instIds = [];   // 発送指示書の対象にする発送ID（v25.96）
         if ((iframe.getAttribute('src') || '').includes('/admin/invoice/invoice')) {
           // 受注管理（受注単位）の納品書：受注に含まれる出荷を選んで日付を設定（v25.85）
           const orderIds = collectOrderIdsFromInvoice(iframe, form);
@@ -941,6 +1239,12 @@
             const sel = await askOrderInvoiceDates(shipments);
             if (!sel) return; // キャンセル → 作成しない
             ids = sel.ids; dates = sel;   // 「日付なしで作成」のときは ids が空（v25.86）
+            // 発送指示書の対象：日付を設定した出荷。日付なしのときは未発送の出荷（なければ全出荷）（v25.96）
+            if (ids.length) instIds = ids.slice();
+            else {
+              const unshipped = shipments.filter(s => s.status !== '発送済').map(s => s.id);
+              instIds = unshipped.length ? unshipped : shipments.map(s => s.id);
+            }
           }
         } else {
           ids = collectLogisticsIdsFromInvoice(iframe, form);
@@ -948,6 +1252,7 @@
             alert('発送IDを特定できなかったため、発送日・納品日を設定できません。\nパネルの印刷ボタンから印刷してください。');
             return;
           }
+          instIds = ids.slice(); // 発送指示書の対象（v25.96）
           dates = await askPrintDates(ids.length);
           if (!dates) return; // キャンセル → 作成しない
           if (dates.skipped) ids = []; // 日付なしで作成（v25.89）
@@ -970,8 +1275,13 @@
         } finally {
           setTimeout(() => { bypass = false; }, 500);
         }
-        // 受注管理シートへの入力確認（v25.92）
-        setTimeout(showSheetEntryNotice, 1500);
+        // 受注管理シートへの入力確認（v25.92）→ 発送指示書（v25.96）→ 送り状CSV（v25.97）
+        setTimeout(async () => {
+          const ctx = { ids: instIds, orders: null };
+          await showSheetEntryNotice();
+          await askShippingInstPrint(ctx);
+          await askCsvCreate(ctx);
+        }, 1500);
       } finally {
         busy = false;
       }
@@ -1036,6 +1346,8 @@
   new MutationObserver(watchNativeInvoiceIframes)
     .observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['src'] });
   watchNativeInvoiceIframes();
+
+  // （v25.99の「納品日が入ったら発送済にする」は v25.100 で廃止。毎晩22時のGASで切り替える）
 
   // タブ切り替え
   document.querySelectorAll('.bcart-tab').forEach(tab => {
@@ -1757,22 +2069,18 @@
       } catch(e) { console.error('取得エラー:', ids[i], e); }
       await new Promise(r => setTimeout(r, 500));
     }
-    if (!pdfBuffers.length) { statusDiv.textContent = '⚠️ 生成に失敗しました'; return; }
+    if (!pdfBuffers.length) { statusDiv.textContent = '⚠️ 生成に失敗しました'; return null; }
 
     statusDiv.textContent = '🖨 PDF結合中…';
     const pdfUrl = await mergePDFBuffers(pdfBuffers);
     statusDiv.textContent = '🖨 印刷ダイアログを表示します…';
     const w = window.open(pdfUrl, '_blank');
-    if (!w) { statusDiv.textContent = '⚠️ ポップアップがブロックされています'; return; }
+    if (!w) { statusDiv.textContent = '⚠️ ポップアップがブロックされています'; return null; }
     await new Promise(r => setTimeout(r, 2500));
     try { w.print(); } catch(e) {}
 
-    // 納品書印刷時にGAS通知
-    if (orders.length) {
-      statusDiv.textContent = '📨 記録・通知中…';
-      const instHtml = generateShippingInstructionHTML(orders);
-      notifyGAS(orders, instHtml);
-    }
+    // 送り状CSVは、印刷後の「CSVを作成しますか？」で「はい」のときだけ作ってダウンロードする（v25.97〜v25.98）
+    return orders; // 発送指示書・送り状CSVに使う（v25.96〜）
   }
 
   // =============================================
@@ -1923,12 +2231,19 @@
         if (!cont) { statusDiv.textContent = `⚠️ 日付設定に失敗した件があるため中止しました（${failed.length}件）`; return; }
       }
 
-      await printWithShippingInstruction(ids, dates.memo);
-      // 受注管理シートへの入力確認（v25.92）
-      showSheetEntryNotice();
-      statusDiv.textContent = dates.skipped
-        ? `✅ ${ids.length}件 印刷完了（日付は設定していません）`
-        : `✅ ${ids.length}件 印刷完了（発送日 ${dates.shipDate} / 納品日 ${dates.arrivalDate}）`;
+      const printedOrders = await printWithShippingInstruction(ids, dates.memo);
+      if (printedOrders) {
+        statusDiv.textContent = dates.skipped
+          ? `✅ ${ids.length}件 印刷完了（日付は設定していません）`
+          : `✅ ${ids.length}件 印刷完了（発送日 ${dates.shipDate} / 納品日 ${dates.arrivalDate}）`;
+      }
+      // 受注管理シートへの入力確認（v25.92）→ 発送指示書を印刷するか確認（v25.96）
+      await showSheetEntryNotice();
+      if (printedOrders && printedOrders.length) {
+        const ctx = { ids, orders: printedOrders };
+        await askShippingInstPrint(ctx);   // 発送指示書（v25.96）
+        await askCsvCreate(ctx);           // 送り状CSV（v25.97）
+      }
     } finally {
       setBtns(false);
     }
@@ -2010,6 +2325,7 @@
     }
     if (arrivalDate) {
       fd.set('arrival_date', arrivalDate.replace(/-/g, '/'));
+      // 発送状況は変えない。発送済への切り替えは毎晩22時のGAS（PITTO 発送済の自動切り替え）で行う（v25.100）
     }
 
     const res = await fetch(`${location.origin}/admin/logistics/${logisticsId}/edit`, {
